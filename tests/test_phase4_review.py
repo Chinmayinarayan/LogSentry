@@ -888,3 +888,83 @@ def test_source_independence_hdfs_retries_do_not_block_nasa(monkeypatch):
     assert len(alerts) == 2
     sources = {a["source"] for a in alerts}
     assert sources == {"HDFS", "NASA-HTTP"}
+
+
+def test_concurrent_direct_persistence_under_controlled_synchronization(monkeypatch):
+    """
+    Deterministic Test A2 — Concurrent direct persistence under controlled synchronization:
+    1. Thread A arrives with ALERT_A.
+    2. Thread A is held paused inside db.save_alert using threading.Event.
+    3. Thread B arrives with ALERT_B and calls _persist_alert_with_retry('hdfs', ALERT_B).
+    4. Thread B is blocked by _source_persistence_locks['hdfs'], and its alert is queued behind A.
+    5. Thread A is released to finish.
+    6. Verify database receives ALERT_A at ID 1, then ALERT_B at ID 2 (strict FIFO order).
+    7. No alerts are lost or duplicated.
+    """
+    parser.reset_pending_alerts()
+    original_save = db.save_alert
+
+    thread_a_inside_db = threading.Event()
+    release_thread_a = threading.Event()
+    save_order = []
+
+    def mock_save_alert(source, alert_type, event_count, window_duration_sec, **kwargs):
+        save_order.append(alert_type)
+        if alert_type == "SYNC_ALERT_A":
+            thread_a_inside_db.set()
+            release_thread_a.wait(timeout=5.0)
+        return original_save(source, alert_type, event_count, window_duration_sec, **kwargs)
+
+    monkeypatch.setattr(db, "save_alert", mock_save_alert)
+
+    errors = []
+
+    def worker_a():
+        try:
+            parser._persist_alert_with_retry("hdfs", {
+                "source": "HDFS",
+                "alert_type": "SYNC_ALERT_A",
+                "event_count": 5,
+                "window_duration_sec": 60,
+            })
+        except Exception as e:
+            errors.append(e)
+
+    def worker_b():
+        try:
+            parser._persist_alert_with_retry("hdfs", {
+                "source": "HDFS",
+                "alert_type": "SYNC_ALERT_B",
+                "event_count": 6,
+                "window_duration_sec": 60,
+            })
+        except Exception as e:
+            errors.append(e)
+
+    t_a = threading.Thread(target=worker_a)
+    t_b = threading.Thread(target=worker_b)
+
+    # Start Thread A
+    t_a.start()
+    # Wait until Thread A is confirmed inside db.save_alert
+    assert thread_a_inside_db.wait(timeout=2.0) is True
+
+    # While Thread A is paused inside db.save_alert, start Thread B
+    t_b.start()
+    time.sleep(0.05)  # Ensure Thread B calls _persist_alert_with_retry and blocks
+
+    # Release Thread A to complete its write
+    release_thread_a.set()
+
+    t_a.join(timeout=3.0)
+    t_b.join(timeout=3.0)
+
+    assert len(errors) == 0
+    assert parser.get_pending_alerts_count("hdfs") == 0
+
+    # Verify database insertion order: SYNC_ALERT_A must be before SYNC_ALERT_B
+    alerts_in_db = db.get_alerts()
+    assert len(alerts_in_db) == 2
+    in_order = sorted(alerts_in_db, key=lambda a: a["alert_id"])
+    assert [a["alert_type"] for a in in_order] == ["SYNC_ALERT_A", "SYNC_ALERT_B"]
+    assert save_order == ["SYNC_ALERT_A", "SYNC_ALERT_B"]
