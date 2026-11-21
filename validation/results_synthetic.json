@@ -1,0 +1,22 @@
+{
+  "log_file": "validation\\fixtures\\synthetic_hdfs_style.log",
+  "total_lines": 17,
+  "classified_events": 14,
+  "quarantined_rejections": 3,
+  "log_level_distribution": {
+    "INFO": 3,
+    "ERROR": 11
+  },
+  "detected_anomaly_blocks_count": 3,
+  "accuracy_eval": {
+    "ground_truth_anomalies": 3,
+    "ground_truth_normals": 1,
+    "true_positives": 3,
+    "false_positives": 0,
+    "false_negatives": 0,
+    "true_negatives": 1,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1_score": 1.0
+  }
+}

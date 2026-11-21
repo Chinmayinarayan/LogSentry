@@ -1,0 +1,10 @@
+2026-09-12 14:00:01 [INFO] web-server: Request served in 40ms
+2026-09-12 14:00:02 [ERROR] auth-service: Failed login for user alice
+2026-09-12 14:00:03 [ERROR] auth-service: Failed login for user bob
+2026-09-12 14:00:04 [ERROR] auth-service: Failed login for user carol
+2026-09-12 14:00:05 [ERROR] auth-service: Failed login for user dave
+2026-09-12 14:00:06 [ERROR] auth-service: Failed login for user eve
+2026-09-12 14:00:07 [INFO] web-server: Request served in 55ms
+2026-09-12 14:00:08 [ERROR] db-service: Connection refused to replica-2
+2026-09-12 14:00:09 [WARN] web-server: Slow response 900ms
+2026-09-12 14:00:10 [INFO] auth-service: Login success for user frank

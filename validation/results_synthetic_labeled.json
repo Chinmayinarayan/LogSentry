@@ -1,0 +1,75 @@
+{
+  "generated_at": "2026-09-12T08:53:01Z",
+  "project": "LogSentry",
+  "stage": 1,
+  "log_path": "T:\\logsentry_working\\logsentry\\validation\\fixtures\\synthetic_hdfs_style.log",
+  "labels_path": "T:\\logsentry_working\\logsentry\\validation\\fixtures\\synthetic_anomaly_label.csv",
+  "source_name": "validation",
+  "detector": {
+    "window_seconds": 10,
+    "threshold": 5,
+    "tracked_categories": [
+      "auth_failure"
+    ]
+  },
+  "lines_processed": 16,
+  "lines_skipped_blank": 0,
+  "events_recorded": 16,
+  "alerts_fired": 2,
+  "alert_categories": {
+    "auth_failure": 2
+  },
+  "event_categories": {
+    "uncategorized": 5,
+    "auth_failure": 11
+  },
+  "alerts": [
+    {
+      "timestamp": "2026-09-12T08:53:01Z",
+      "alert_type": "sliding_window",
+      "category": "auth_failure",
+      "severity": "CRITICAL",
+      "source": "validation",
+      "message": "Anomaly: 5+ 'auth_failure' events within 10s \u2014 last: 2026-09-12 12:00:02 [ERROR] auth-service: Failed login for user guest blk_1001",
+      "matched_line": "2026-09-12 12:00:02 [ERROR] auth-service: Failed login for user guest blk_1001",
+      "block_ids": [
+        "blk_1001"
+      ]
+    },
+    {
+      "timestamp": "2026-09-12T08:53:01Z",
+      "alert_type": "sliding_window",
+      "category": "auth_failure",
+      "severity": "CRITICAL",
+      "source": "validation",
+      "message": "Anomaly: 5+ 'auth_failure' events within 10s \u2014 last: 2026-09-12 12:00:05 [ERROR] auth-service: Failed login for user dave blk_3003",
+      "matched_line": "2026-09-12 12:00:05 [ERROR] auth-service: Failed login for user dave blk_3003",
+      "block_ids": [
+        "blk_3003"
+      ]
+    }
+  ],
+  "evaluation": {
+    "mode": "validated_against_ground_truth",
+    "join_key": "HDFS BlockId (blk_*)",
+    "label_rows": 4,
+    "blocks_in_log": 3,
+    "evaluation_universe_size": 3,
+    "ground_truth_anomalies_in_universe": 2,
+    "ground_truth_normal_in_universe": 1,
+    "predicted_anomalous_blocks": 2,
+    "true_positives": 2,
+    "false_positives": 0,
+    "false_negatives": 0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "true_positive_blocks": [
+      "blk_1001",
+      "blk_3003"
+    ],
+    "false_positive_blocks": [],
+    "false_negative_blocks": [],
+    "false_negative_blocks_truncated": 0
+  }
+}

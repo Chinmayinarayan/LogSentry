@@ -1,0 +1,48 @@
+{
+  "generated_at": "2026-09-12T08:53:01Z",
+  "project": "LogSentry",
+  "stage": 1,
+  "log_path": "T:\\logsentry_working\\logsentry\\data\\sample.log",
+  "labels_path": null,
+  "source_name": "validation",
+  "detector": {
+    "window_seconds": 10,
+    "threshold": 5,
+    "tracked_categories": [
+      "auth_failure"
+    ]
+  },
+  "lines_processed": 10,
+  "lines_skipped_blank": 0,
+  "events_recorded": 10,
+  "alerts_fired": 1,
+  "alert_categories": {
+    "auth_failure": 1
+  },
+  "event_categories": {
+    "uncategorized": 4,
+    "auth_failure": 5,
+    "network_failure": 1
+  },
+  "alerts": [
+    {
+      "timestamp": "2026-09-12T08:53:01Z",
+      "alert_type": "sliding_window",
+      "category": "auth_failure",
+      "severity": "CRITICAL",
+      "source": "validation",
+      "message": "Anomaly: 5+ 'auth_failure' events within 10s \u2014 last: 2026-09-12 14:00:06 [ERROR] auth-service: Failed login for user eve",
+      "matched_line": "2026-09-12 14:00:06 [ERROR] auth-service: Failed login for user eve",
+      "block_ids": []
+    }
+  ],
+  "evaluation": {
+    "mode": "unvalidated_counts",
+    "warning": "UNVALIDATED COUNTS \u2014 no ground truth available. These figures are NOT an accuracy measurement (no Precision/Recall/F1).",
+    "total_lines_processed": 10,
+    "total_alerts_fired": 1,
+    "categories_that_triggered_alerts": {
+      "auth_failure": 1
+    }
+  }
+}

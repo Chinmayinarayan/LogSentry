@@ -1,0 +1,23 @@
+# Master Cursor Architecture Context & Rules File
+# Project: LogSentry — Multi-threaded Log Analysis & Alerting System (Theme 5)
+
+## 1. Project Mandate & Academic Context
+- **Theme Selection:** Theme 5: Multi-threaded Log Analysis & Alerting System[cite: 1].
+- **Team Size:** 4 third-year students building a resume-grade, enterprise-ready Security Information and Event Management (SIEM) application[cite: 1].
+- **Evaluation Framework:** Compliant with a Hybrid SDLC 4-Engine, 5-Gate evaluation rubric (spanning problem definition, functional requirements, shared architecture, implementation, validation, and root cause analysis)[cite: 1].
+
+## 2. The 4-Engine Architectural Model
+Every feature and component must align cleanly with one of these four core computer science domains[cite: 1]:
+* **OS Engine:** Multithreaded log tailers (`watch/tailer.py`), background worker thread pools, thread-safe synchronization queues, and bounded concurrency protection[cite: 1].
+* **DSA Engine:** Sliding-window anomaly detection algorithms, regular expression pattern matchers, and real-time threshold telemetry[cite: 1].
+* **DBMS Engine:** Append-only SQLite database vaults (`logsentry.db`), audit trail tables (`upload_history`), and persistent state tracking[cite: 1].
+* **Web & Networks Engine:** Flask RESTful API endpoints (`/api/reset`, `/api/metrics/timeseries`, `/api/logs`, `/api/upload`), async polling loops, and a dark-themed SOC dashboard with live Chart.js visualizations[cite: 1].
+
+## 3. Current Implementation Status & Objective
+- **Stable Core:** Backend APIs, append-only SQLite storage, and sliding-window alerts are fully operational.
+- **Current Focus:** Elevating the frontend interface, refining modern file selection components, optimizing chart rendering, and ensuring strict visual and architectural polish for the college viva[cite: 1].
+
+## 4. Coding Instructions for Cursor
+- When writing code or modifying files, preserve the decoupled architecture where Flask serves as a JSON API backend and the HTML/JS dashboard consumes telemetry asynchronously.
+- Avoid breaking existing database schemas or route names unless explicitly instructed.
+- Maintain production-grade clean code practices suitable for technical interviews and formal academic evaluation[cite: 1].

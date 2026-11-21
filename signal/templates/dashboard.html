@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LogSentry — Real-Time Log Analysis & Alerting SOC</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    body { background-color: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
+    .glass { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.08); }
+    .glass-card { background: #1e293b; border: 1px solid #334155; }
+  </style>
+</head>
+<body class="min-h-screen pb-12">
+
+  <!-- TOP NAVIGATION BAR -->
+  <nav class="glass sticky top-0 z-40 px-6 py-4 flex items-center justify-between shadow-lg">
+    <div class="flex items-center space-x-3">
+      <div class="w-10 h-10 rounded-lg bg-indigo-600 flex items-center justify-center text-white font-bold text-xl shadow-lg shadow-indigo-500/30">
+        <i class="fa-solid fa-shield-halved"></i>
+      </div>
+      <div>
+        <h1 class="text-xl font-bold tracking-wide text-white">LogSentry <span class="text-xs px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">v2.0 Production</span></h1>
+        <p class="text-xs text-slate-400">Multi-threaded HDFS & NASA-HTTP Analysis System</p>
+      </div>
+    </div>
+
+    <!-- USER & AUTH STATUS -->
+    <div class="flex items-center space-x-4">
+      <div id="userInfo" class="flex items-center space-x-2 text-sm">
+        <span class="text-slate-400">User:</span>
+        <span id="usernameBadge" class="font-semibold text-indigo-300">Guest (Unauthenticated)</span>
+        <span id="roleBadge" class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">NONE</span>
+      </div>
+      <button id="authBtn" onclick="toggleAuthModal()" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-sm transition shadow-md">
+        <i class="fa-solid fa-right-to-bracket mr-1.5"></i> Login
+      </button>
+    </div>
+  </nav>
+
+  <div class="max-w-7xl mx-auto px-6 pt-6 space-y-6">
+
+    <!-- METRICS CARDS GRID -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+      <div class="glass-card rounded-xl p-5 border-l-4 border-indigo-500 shadow">
+        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
+          <span>Total Classified Events</span>
+          <i class="fa-solid fa-database text-indigo-400 text-base"></i>
+        </div>
+        <div id="statTotalEvents" class="text-2xl font-bold text-white mt-2">0</div>
+        <div class="text-xs text-slate-400 mt-1">HDFS & NASA-HTTP parsed</div>
+      </div>
+
+      <div class="glass-card rounded-xl p-5 border-l-4 border-amber-500 shadow">
+        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
+          <span>Errors & Warnings</span>
+          <i class="fa-solid fa-triangle-exclamation text-amber-400 text-base"></i>
+        </div>
+        <div id="statErrors" class="text-2xl font-bold text-amber-400 mt-2">0</div>
+        <div class="text-xs text-slate-400 mt-1">WARN / ERROR log lines</div>
+      </div>
+
+      <div class="glass-card rounded-xl p-5 border-l-4 border-rose-500 shadow">
+        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
+          <span>Active Alerts</span>
+          <i class="fa-solid fa-bell text-rose-400 text-base"></i>
+        </div>
+        <div id="statActiveAlerts" class="text-2xl font-bold text-rose-400 mt-2">0</div>
+        <div class="text-xs text-slate-400 mt-1">Sliding-window bursts</div>
+      </div>
+
+      <div class="glass-card rounded-xl p-5 border-l-4 border-purple-500 shadow">
+        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
+          <span>Quarantined / Rejected</span>
+          <i class="fa-solid fa-ban text-purple-400 text-base"></i>
+        </div>
+        <div id="statRejected" class="text-2xl font-bold text-purple-300 mt-2">0</div>
+        <div class="text-xs text-slate-400 mt-1 cursor-pointer hover:underline text-purple-400" onclick="fetchRejectedLines()">
+          View rejected input log &rarr;
+        </div>
+      </div>
+
+      <div class="glass-card rounded-xl p-5 border-l-4 border-emerald-500 shadow">
+        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
+          <span>Engine Status</span>
+          <i class="fa-solid fa-network-wired text-emerald-400 text-base"></i>
+        </div>
+        <div class="text-lg font-bold text-emerald-400 mt-2 flex items-center space-x-2">
+          <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span>HEALTHY</span>
+        </div>
+        <div class="text-xs text-slate-400 mt-1">
+          Threads: <span id="statThreads" class="text-white font-medium">0</span> | Queue: <span id="statQueue" class="text-white font-medium">0</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- MAIN DASHBOARD CONTENT GRID -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+      <!-- LEFT 2 COLUMNS: CHART + ACTIVE ALERTS + INGESTION -->
+      <div class="lg:col-span-2 space-y-6">
+
+        <!-- TIMESERIES CHART -->
+        <div class="glass-card rounded-xl p-6 shadow">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-lg font-bold text-white flex items-center space-x-2">
+              <i class="fa-solid fa-chart-line text-indigo-400"></i>
+              <span>Live Ingestion & Error Rate Timeline</span>
+            </h2>
+            <span class="text-xs text-slate-400">Auto-refreshing every 3s</span>
+          </div>
+          <div class="h-64">
+            <canvas id="timelineChart"></canvas>
+          </div>
+        </div>
+
+        <!-- ACTIVE ANOMALY ALERTS -->
+        <div class="glass-card rounded-xl p-6 shadow">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-lg font-bold text-white flex items-center space-x-2">
+              <i class="fa-solid fa-circle-exclamation text-rose-400"></i>
+              <span>Sliding-Window Anomaly Alerts</span>
+            </h2>
+            <button onclick="fetchAlerts()" class="text-xs text-indigo-400 hover:text-indigo-300">
+              <i class="fa-solid fa-rotate-right mr-1"></i> Refresh
+            </button>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-sm text-slate-300">
+              <thead class="text-xs uppercase bg-slate-800/80 text-slate-400 border-b border-slate-700">
+                <tr>
+                  <th class="py-3 px-4">Alert ID</th>
+                  <th class="py-3 px-4">Timestamp</th>
+                  <th class="py-3 px-4">Source</th>
+                  <th class="py-3 px-4">Type</th>
+                  <th class="py-3 px-4">Count / Window</th>
+                  <th class="py-3 px-4">Status</th>
+                  <th class="py-3 px-4">Action</th>
+                </tr>
+              </thead>
+              <tbody id="alertsTableBody" class="divide-y divide-slate-800">
+                <tr>
+                  <td colspan="7" class="py-6 text-center text-slate-500">No active anomaly alerts detected.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- INGESTION CONTROLS (FILE UPLOAD + LIVE TAILING) -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+          <!-- FILE INGESTION FORM -->
+          <div class="glass-card rounded-xl p-5 shadow space-y-4">
+            <h3 class="font-bold text-white flex items-center space-x-2">
+              <i class="fa-solid fa-file-arrow-up text-indigo-400"></i>
+              <span>File Ingestion (Replay / Zip)</span>
+            </h3>
+            <form id="uploadForm" onsubmit="handleUpload(event)" class="space-y-3">
+              <div>
+                <label class="block text-xs font-semibold text-slate-400 mb-1">Declared Source Format</label>
+                <select id="uploadSource" class="w-full bg-slate-800 border border-slate-700 rounded p-2 text-sm text-white focus:outline-none focus:border-indigo-500">
+                  <option value="hdfs">HDFS Loghub Format</option>
+                  <option value="nasa_http">NASA-HTTP Common Log Format</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-semibold text-slate-400 mb-1">Select File (.log, .txt, .zip)</label>
+                <input type="file" id="uploadFile" required class="w-full text-xs text-slate-400 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500">
+              </div>
+              <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2 rounded-lg text-sm transition flex items-center justify-center space-x-2">
+                <i class="fa-solid fa-cloud-arrow-up"></i>
+                <span>Upload & Process Lines</span>
+              </button>
+            </form>
+          </div>
+
+          <!-- LIVE TAILING CONTROL -->
+          <div class="glass-card rounded-xl p-5 shadow space-y-4">
+            <h3 class="font-bold text-white flex items-center space-x-2">
+              <i class="fa-solid fa-play text-emerald-400"></i>
+              <span>Live File Tailing Mode</span>
+            </h3>
+            <form id="liveTailForm" onsubmit="handleLiveTailStart(event)" class="space-y-3">
+              <div>
+                <label class="block text-xs font-semibold text-slate-400 mb-1">Source Name</label>
+                <input type="text" id="liveSource" placeholder="e.g. hdfs or nasa_http" required class="w-full bg-slate-800 border border-slate-700 rounded p-2 text-sm text-white focus:outline-none focus:border-indigo-500">
+              </div>
+              <div>
+                <label class="block text-xs font-semibold text-slate-400 mb-1">Local File Path</label>
+                <input type="text" id="livePath" placeholder="/var/log/apache2/access.log" required class="w-full bg-slate-800 border border-slate-700 rounded p-2 text-sm text-white focus:outline-none focus:border-indigo-500">
+              </div>
+              <div class="flex space-x-2">
+                <button type="submit" class="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2 rounded-lg text-xs transition">
+                  <i class="fa-solid fa-play mr-1"></i> Start Tailing
+                </button>
+                <button type="button" onclick="handleLiveTailStop()" class="flex-1 bg-rose-600 hover:bg-rose-500 text-white font-medium py-2 rounded-lg text-xs transition">
+                  <i class="fa-solid fa-stop mr-1"></i> Stop Tailing
+                </button>
+              </div>
+            </form>
+            <button onclick="triggerSimulation()" class="w-full bg-slate-800 hover:bg-slate-700 border border-slate-700 text-indigo-300 font-medium py-2 rounded-lg text-xs transition">
+              <i class="fa-solid fa-bolt mr-1 text-amber-400"></i> Trigger Demo Anomaly Burst
+            </button>
+          </div>
+
+        </div>
+
+      </div>
+
+      <!-- RIGHT 1 COLUMN: ADMIN CONFIG + QUARANTINE LOG + USER ROLES -->
+      <div class="space-y-6">
+
+        <!-- ADMIN CONFIGURATION PANEL (W & T) -->
+        <div class="glass-card rounded-xl p-6 shadow space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+            <h2 class="text-base font-bold text-white flex items-center space-x-2">
+              <i class="fa-solid fa-sliders text-indigo-400"></i>
+              <span>Sliding Window Thresholds (Admin)</span>
+            </h2>
+            <span class="text-xs px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300">Config W & T</span>
+          </div>
+          <form id="configForm" onsubmit="handleConfigUpdate(event)" class="space-y-4">
+            <div class="p-3 bg-slate-800/50 rounded-lg space-y-2 border border-slate-700">
+              <div class="text-xs font-bold text-slate-300 uppercase">HDFS Source</div>
+              <div class="grid grid-cols-2 gap-2 text-xs">
+                <div>
+                  <label class="text-slate-400 block mb-1">Window W (sec)</label>
+                  <input type="number" id="cfg_hdfs_window" value="60" min="1" class="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-white">
+                </div>
+                <div>
+                  <label class="text-slate-400 block mb-1">Threshold T (cnt)</label>
+                  <input type="number" id="cfg_hdfs_threshold" value="5" min="1" class="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-white">
+                </div>
+              </div>
+            </div>
+
+            <div class="p-3 bg-slate-800/50 rounded-lg space-y-2 border border-slate-700">
+              <div class="text-xs font-bold text-slate-300 uppercase">NASA-HTTP Source</div>
+              <div class="grid grid-cols-2 gap-2 text-xs">
+                <div>
+                  <label class="text-slate-400 block mb-1">Window W (sec)</label>
+                  <input type="number" id="cfg_nasa_http_window" value="60" min="1" class="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-white">
+                </div>
+                <div>
+                  <label class="text-slate-400 block mb-1">Threshold T (cnt)</label>
+                  <input type="number" id="cfg_nasa_http_threshold" value="5" min="1" class="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-white">
+                </div>
+              </div>
+            </div>
+
+            <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2 rounded-lg text-xs transition">
+              <i class="fa-solid fa-floppy-disk mr-1"></i> Save Thresholds (Admin Only)
+            </button>
+          </form>
+          <div class="text-right">
+            <button onclick="fetchConfigHistory()" class="text-xs text-indigo-400 hover:underline">
+              View Threshold Audit History &rarr;
+            </button>
+          </div>
+        </div>
+
+        <!-- QUICK SYSTEM RESET -->
+        <div class="glass-card rounded-xl p-5 shadow flex items-center justify-between">
+          <div>
+            <div class="text-sm font-bold text-white">Reset Database & State</div>
+            <div class="text-xs text-slate-400">Clear events and active alerts</div>
+          </div>
+          <button onclick="handleReset()" class="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 text-xs font-semibold">
+            <i class="fa-solid fa-trash-can mr-1"></i> Reset
+          </button>
+        </div>
+
+      </div>
+
+    </div>
+
+    <!-- CLASSIFIED LOG EVENTS TABLE -->
+    <div class="glass-card rounded-xl p-6 shadow space-y-4">
+      <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 border-b border-slate-700 pb-4">
+        <h2 class="text-lg font-bold text-white flex items-center space-x-2">
+          <i class="fa-solid fa-list-check text-indigo-400"></i>
+          <span>Classified Log Stream</span>
+        </h2>
+        <div class="flex flex-wrap items-center gap-3">
+          <select id="filterSource" onchange="fetchEvents()" class="bg-slate-800 border border-slate-700 rounded p-2 text-xs text-white">
+            <option value="">All Sources</option>
+            <option value="HDFS">HDFS</option>
+            <option value="NASA-HTTP">NASA-HTTP</option>
+          </select>
+          <select id="filterLevel" onchange="fetchEvents()" class="bg-slate-800 border border-slate-700 rounded p-2 text-xs text-white">
+            <option value="">All Levels</option>
+            <option value="INFO">INFO</option>
+            <option value="WARN">WARN</option>
+            <option value="ERROR">ERROR</option>
+          </select>
+          <button onclick="fetchEvents()" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-xs font-semibold text-white">
+            <i class="fa-solid fa-rotate-right mr-1"></i> Refresh
+          </button>
+        </div>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-xs text-slate-300">
+          <thead class="uppercase bg-slate-800/80 text-slate-400 border-b border-slate-700">
+            <tr>
+              <th class="py-3 px-4">ID</th>
+              <th class="py-3 px-4">Timestamp</th>
+              <th class="py-3 px-4">Source</th>
+              <th class="py-3 px-4">Level</th>
+              <th class="py-3 px-4">Host / Component</th>
+              <th class="py-3 px-4">Raw Classified Message</th>
+            </tr>
+          </thead>
+          <tbody id="eventsTableBody" class="divide-y divide-slate-800">
+            <tr>
+              <td colspan="6" class="py-8 text-center text-slate-500">No events ingested yet.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- AUTH MODAL -->
+  <div id="authModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="glass-card rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4 border border-slate-700">
+      <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+        <h3 class="text-lg font-bold text-white flex items-center space-x-2">
+          <i class="fa-solid fa-user-lock text-indigo-400"></i>
+          <span>LogSentry Authentication</span>
+        </h3>
+        <button onclick="toggleAuthModal()" class="text-slate-400 hover:text-white">&times;</button>
+      </div>
+
+      <form id="loginForm" onsubmit="handleLogin(event)" class="space-y-3">
+        <div>
+          <label class="block text-xs font-semibold text-slate-400 mb-1">Username</label>
+          <input type="text" id="loginUsername" placeholder="admin, operator, or viewer" required class="w-full bg-slate-800 border border-slate-700 rounded p-2 text-sm text-white focus:outline-none focus:border-indigo-500">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-400 mb-1">Password</label>
+          <input type="password" id="loginPassword" placeholder="••••••••" required class="w-full bg-slate-800 border border-slate-700 rounded p-2 text-sm text-white focus:outline-none focus:border-indigo-500">
+        </div>
+        <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2 rounded-lg text-sm transition">
+          Log In
+        </button>
+      </form>
+      <div class="text-xs text-slate-400 border-t border-slate-800 pt-3 space-y-1">
+        <div class="font-semibold text-slate-300">Pre-seeded Credentials:</div>
+        <div>Admin: <code class="text-indigo-300">admin / adminpassword</code></div>
+        <div>Operator: <code class="text-indigo-300">operator / operatorpassword</code></div>
+        <div>Viewer: <code class="text-indigo-300">viewer / viewerpassword</code></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- REJECTED LINES MODAL -->
+  <div id="rejectedModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="glass-card rounded-2xl max-w-4xl w-full p-6 shadow-2xl space-y-4 border border-purple-500/30 max-h-[80vh] flex flex-col">
+      <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+        <h3 class="text-lg font-bold text-white flex items-center space-x-2">
+          <i class="fa-solid fa-ban text-purple-400"></i>
+          <span>Quarantined / Rejected Lines Log</span>
+        </h3>
+        <button onclick="toggleRejectedModal()" class="text-slate-400 hover:text-white">&times;</button>
+      </div>
+      <div class="overflow-y-auto flex-1">
+        <table class="w-full text-left text-xs text-slate-300">
+          <thead class="uppercase bg-slate-800 text-slate-400 border-b border-slate-700 sticky top-0">
+            <tr>
+              <th class="py-2.5 px-3">ID</th>
+              <th class="py-2.5 px-3">Timestamp</th>
+              <th class="py-2.5 px-3">Declared Source</th>
+              <th class="py-2.5 px-3">Quarantine Reason</th>
+              <th class="py-2.5 px-3">Raw Bytes Preview</th>
+            </tr>
+          </thead>
+          <tbody id="rejectedTableBody" class="divide-y divide-slate-800 font-mono">
+            <tr><td colspan="5" class="py-6 text-center text-slate-500">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- GENERIC HISTORY AUDIT MODAL -->
+  <div id="historyModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="glass-card rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-4 border border-slate-700">
+      <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+        <h3 id="historyModalTitle" class="text-lg font-bold text-white">Audit Change History</h3>
+        <button onclick="toggleHistoryModal()" class="text-slate-400 hover:text-white">&times;</button>
+      </div>
+      <div class="overflow-y-auto max-h-96">
+        <table class="w-full text-left text-xs text-slate-300">
+          <thead class="uppercase bg-slate-800 text-slate-400 border-b border-slate-700 sticky top-0">
+            <tr>
+              <th class="py-2 px-3">Time</th>
+              <th class="py-2 px-3">Field</th>
+              <th class="py-2 px-3">Old Value</th>
+              <th class="py-2 px-3">New Value</th>
+              <th class="py-2 px-3">Changed By</th>
+            </tr>
+          </thead>
+          <tbody id="historyTableBody" class="divide-y divide-slate-800">
+            <tr><td colspan="5" class="py-4 text-center text-slate-500">No records found.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- DASHBOARD JAVASCRIPT -->
+  <script>
+    let timelineChart = null;
+    let currentUser = null;
+
+    // Initialize Chart.js
+    function initChart() {
+      const ctx = document.getElementById('timelineChart').getContext('2d');
+      timelineChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [
+            {
+              label: 'Classified Events',
+              data: [],
+              borderColor: '#6366f1',
+              backgroundColor: 'rgba(99, 102, 241, 0.1)',
+              borderWidth: 2,
+              fill: true,
+              tension: 0.3
+            },
+            {
+              label: 'Errors & Warnings',
+              data: [],
+              borderColor: '#f59e0b',
+              backgroundColor: 'rgba(245, 158, 11, 0.1)',
+              borderWidth: 2,
+              fill: true,
+              tension: 0.3
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { labels: { color: '#94a3b8' } } },
+          scales: {
+            x: { ticks: { color: '#64748b' }, grid: { color: 'rgba(255,255,255,0.05)' } },
+            y: { ticks: { color: '#64748b' }, grid: { color: 'rgba(255,255,255,0.05)' } }
+          }
+        }
+      });
+    }
+
+    async function checkAuth() {
+      try {
+        const res = await fetch('/api/me');
+        const data = await res.json();
+        if (data.authenticated) {
+          currentUser = data.user;
+          document.getElementById('usernameBadge').textContent = currentUser.username;
+          document.getElementById('roleBadge').textContent = currentUser.role;
+          document.getElementById('authBtn').innerHTML = '<i class="fa-solid fa-right-from-bracket mr-1.5"></i> Logout';
+          document.getElementById('authBtn').onclick = handleLogout;
+        } else {
+          currentUser = null;
+          document.getElementById('usernameBadge').textContent = 'Guest (Unauthenticated)';
+          document.getElementById('roleBadge').textContent = 'NONE';
+          document.getElementById('authBtn').innerHTML = '<i class="fa-solid fa-right-to-bracket mr-1.5"></i> Login';
+          document.getElementById('authBtn').onclick = toggleAuthModal;
+        }
+      } catch (e) {
+        console.error('Auth check error:', e);
+      }
+    }
+
+    async function fetchStats() {
+      try {
+        const res = await fetch('/api/stats');
+        const data = await res.json();
+        document.getElementById('statTotalEvents').textContent = data.total_events.toLocaleString();
+        document.getElementById('statErrors').textContent = data.errors.toLocaleString();
+        document.getElementById('statActiveAlerts').textContent = data.active_alerts.toLocaleString();
+        document.getElementById('statRejected').textContent = data.rejected_lines.toLocaleString();
+        document.getElementById('statThreads').textContent = data.active_threads;
+        document.getElementById('statQueue').textContent = data.queue_size;
+      } catch (e) { console.error('Fetch stats error:', e); }
+    }
+
+    async function fetchChart() {
+      try {
+        const res = await fetch('/api/metrics/timeseries');
+        const data = await res.json();
+        if (timelineChart && data.labels) {
+          timelineChart.data.labels = data.labels;
+          timelineChart.data.datasets[0].data = data.events;
+          timelineChart.data.datasets[1].data = data.errors;
+          timelineChart.update('none');
+        }
+      } catch (e) { console.error('Fetch chart error:', e); }
+    }
+
+    async function fetchAlerts() {
+      try {
+        const res = await fetch('/api/alerts');
+        const data = await res.json();
+        const tbody = document.getElementById('alertsTableBody');
+        if (!data.alerts || data.alerts.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="7" class="py-6 text-center text-slate-500">No anomaly alerts recorded yet.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.alerts.map(a => `
+          <tr class="${a.status === 'ACTIVE' ? 'bg-rose-950/20 font-medium' : ''}">
+            <td class="py-3 px-4 text-indigo-400">#${a.alert_id}</td>
+            <td class="py-3 px-4">${a.timestamp}</td>
+            <td class="py-3 px-4 font-bold text-white">${a.source}</td>
+            <td class="py-3 px-4 text-rose-400">${a.alert_type}</td>
+            <td class="py-3 px-4">${a.event_count} events / ${a.window_duration_sec}s</td>
+            <td class="py-3 px-4">
+              <span class="px-2 py-0.5 rounded text-xs font-semibold ${a.status === 'ACTIVE' ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30 animate-pulse' : 'bg-emerald-500/20 text-emerald-400'}">
+                ${a.status}
+              </span>
+            </td>
+            <td class="py-3 px-4 space-x-2">
+              ${a.status === 'ACTIVE' ? `<button onclick="resolveAlert(${a.alert_id})" class="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs">Resolve</button>` : '<span class="text-slate-500 text-xs">Resolved</span>'}
+              <button onclick="fetchAlertHistory(${a.alert_id})" class="text-indigo-400 hover:underline text-xs">History</button>
+            </td>
+          </tr>
+        `).join('');
+      } catch (e) { console.error('Fetch alerts error:', e); }
+    }
+
+    async function fetchEvents() {
+      try {
+        const source = document.getElementById('filterSource').value;
+        const level = document.getElementById('filterLevel').value;
+        const res = await fetch(`/api/events?limit=50&source=${encodeURIComponent(source)}&level=${encodeURIComponent(level)}`);
+        const data = await res.json();
+        const tbody = document.getElementById('eventsTableBody');
+        if (!data.events || data.events.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" class="py-8 text-center text-slate-500">No classified events found.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.events.map(e => `
+          <tr>
+            <td class="py-2.5 px-4 text-slate-500">#${e.id}</td>
+            <td class="py-2.5 px-4 font-mono">${e.timestamp}</td>
+            <td class="py-2.5 px-4 font-bold text-slate-300">${e.source}</td>
+            <td class="py-2.5 px-4">
+              <span class="px-2 py-0.5 rounded text-[10px] font-bold ${e.log_level === 'ERROR' ? 'bg-rose-500/20 text-rose-400' : e.log_level === 'WARN' ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-700 text-slate-300'}">
+                ${e.log_level}
+              </span>
+            </td>
+            <td class="py-2.5 px-4 text-slate-400 font-mono">${e.component_host || '-'}</td>
+            <td class="py-2.5 px-4 font-mono text-slate-200 truncate max-w-md">${escapeHtml(e.raw_message)}</td>
+          </tr>
+        `).join('');
+      } catch (e) { console.error('Fetch events error:', e); }
+    }
+
+    async function fetchConfig() {
+      try {
+        const res = await fetch('/api/config');
+        const data = await res.json();
+        if (data.config) {
+          if (data.config.hdfs_window) document.getElementById('cfg_hdfs_window').value = data.config.hdfs_window;
+          if (data.config.hdfs_threshold) document.getElementById('cfg_hdfs_threshold').value = data.config.hdfs_threshold;
+          if (data.config.nasa_http_window) document.getElementById('cfg_nasa_http_window').value = data.config.nasa_http_window;
+          if (data.config.nasa_http_threshold) document.getElementById('cfg_nasa_http_threshold').value = data.config.nasa_http_threshold;
+        }
+      } catch (e) { console.error('Fetch config error:', e); }
+    }
+
+    async function resolveAlert(alertId) {
+      try {
+        const res = await fetch(`/api/alerts/${alertId}/resolve`, { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+          alert(data.message);
+          fetchAlerts();
+          fetchStats();
+        } else {
+          alert('Error: ' + data.error);
+        }
+      } catch (e) { alert('Failed to resolve alert: ' + e); }
+    }
+
+    async function handleUpload(e) {
+      e.preventDefault();
+      const fileInput = document.getElementById('uploadFile');
+      const source = document.getElementById('uploadSource').value;
+      if (!fileInput.files.length) return;
+
+      const formData = new FormData();
+      formData.append('file', fileInput.files[0]);
+      formData.append('source', source);
+
+      try {
+        const res = await fetch('/api/ingest/file', { method: 'POST', body: formData });
+        const data = await res.json();
+        alert(data.message || `File uploaded! Lines queued: ${data.lines_queued || 0}`);
+        fetchEvents();
+        fetchStats();
+      } catch (err) { alert('Upload failed: ' + err); }
+    }
+
+    async function handleLiveTailStart(e) {
+      e.preventDefault();
+      const source = document.getElementById('liveSource').value;
+      const file_path = document.getElementById('livePath').value;
+
+      try {
+        const res = await fetch('/api/ingest/live/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source, file_path })
+        });
+        const data = await res.json();
+        alert(data.message || data.error);
+        fetchStats();
+      } catch (err) { alert('Start live tail failed: ' + err); }
+    }
+
+    async function handleLiveTailStop() {
+      const source = document.getElementById('liveSource').value;
+      if (!source) return alert('Enter source name');
+      try {
+        const res = await fetch('/api/ingest/live/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source })
+        });
+        const data = await res.json();
+        alert(data.message || data.error);
+        fetchStats();
+      } catch (err) { alert('Stop live tail failed: ' + err); }
+    }
+
+    async function triggerSimulation() {
+      try {
+        const res = await fetch('/api/simulate-auth-failure', { method: 'POST' });
+        const data = await res.json();
+        alert(data.message);
+        setTimeout(() => { fetchEvents(); fetchAlerts(); fetchStats(); }, 500);
+      } catch (e) { alert('Simulation error: ' + e); }
+    }
+
+    async function handleConfigUpdate(e) {
+      e.preventDefault();
+      const body = {
+        hdfs_window: document.getElementById('cfg_hdfs_window').value,
+        hdfs_threshold: document.getElementById('cfg_hdfs_threshold').value,
+        nasa_http_window: document.getElementById('cfg_nasa_http_window').value,
+        nasa_http_threshold: document.getElementById('cfg_nasa_http_threshold').value,
+      };
+
+      try {
+        const res = await fetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        if (res.ok) {
+          alert('Thresholds updated successfully!');
+        } else {
+          alert('Error: ' + data.error);
+        }
+      } catch (err) { alert('Config update failed: ' + err); }
+    }
+
+    async function handleLogin(e) {
+      e.preventDefault();
+      const u = document.getElementById('loginUsername').value;
+      const p = document.getElementById('loginPassword').value;
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: u, password: p })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          toggleAuthModal();
+          checkAuth();
+        } else {
+          alert('Login error: ' + data.error);
+        }
+      } catch (err) { alert('Login failed: ' + err); }
+    }
+
+    async function handleLogout() {
+      await fetch('/api/logout', { method: 'POST' });
+      checkAuth();
+    }
+
+    async function fetchRejectedLines() {
+      try {
+        const res = await fetch('/api/rejected');
+        const data = await res.json();
+        const tbody = document.getElementById('rejectedTableBody');
+        if (!data.rejected || data.rejected.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" class="py-6 text-center text-slate-500">No quarantined lines in rejected_lines table. Forbidden input guarantee holding!</td></tr>';
+        } else {
+          tbody.innerHTML = data.rejected.map(r => `
+            <tr>
+              <td class="py-2 px-3 text-purple-400">#${r.rejected_id}</td>
+              <td class="py-2 px-3">${r.timestamp}</td>
+              <td class="py-2 px-3 font-bold">${r.source}</td>
+              <td class="py-2 px-3 text-rose-400 font-semibold">${escapeHtml(r.reason)}</td>
+              <td class="py-2 px-3 text-slate-400 truncate max-w-xs">${escapeHtml(r.raw_bytes_preview)}</td>
+            </tr>
+          `).join('');
+        }
+        toggleRejectedModal();
+      } catch (e) { alert('Error loading rejected lines: ' + e); }
+    }
+
+    async function fetchAlertHistory(alertId) {
+      try {
+        const res = await fetch(`/api/alerts/${alertId}/history`);
+        const data = await res.json();
+        document.getElementById('historyModalTitle').textContent = `Audit History for Alert #${alertId}`;
+        const tbody = document.getElementById('historyTableBody');
+        if (!data.history || data.history.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-slate-500">No audit change history for this alert.</td></tr>';
+        } else {
+          tbody.innerHTML = data.history.map(h => `
+            <tr>
+              <td class="py-2 px-3 text-slate-400">${h.changed_at}</td>
+              <td class="py-2 px-3 font-semibold">${h.field_changed}</td>
+              <td class="py-2 px-3 text-slate-500">${h.old_value || 'N/A'}</td>
+              <td class="py-2 px-3 text-emerald-400 font-bold">${h.new_value}</td>
+              <td class="py-2 px-3 text-indigo-300">${h.changed_by_name || 'System'}</td>
+            </tr>
+          `).join('');
+        }
+        toggleHistoryModal();
+      } catch (e) { alert('Error loading alert history: ' + e); }
+    }
+
+    async function fetchConfigHistory() {
+      try {
+        const res = await fetch('/api/config/history');
+        const data = await res.json();
+        document.getElementById('historyModalTitle').textContent = 'Threshold (W & T) Config Change Audit Log';
+        const tbody = document.getElementById('historyTableBody');
+        if (!data.history || data.history.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-slate-500">No past config change history records found.</td></tr>';
+        } else {
+          tbody.innerHTML = data.history.map(h => `
+            <tr>
+              <td class="py-2 px-3 text-slate-400">${h.changed_at}</td>
+              <td class="py-2 px-3 font-semibold text-indigo-300">${h.field_changed}</td>
+              <td class="py-2 px-3 text-slate-500">${h.old_value || 'N/A'}</td>
+              <td class="py-2 px-3 text-emerald-400 font-bold">${h.new_value}</td>
+              <td class="py-2 px-3 text-white font-medium">${h.changed_by_name || 'Admin'}</td>
+            </tr>
+          `).join('');
+        }
+        toggleHistoryModal();
+      } catch (e) { alert('Error loading config history: ' + e); }
+    }
+
+    async function handleReset() {
+      if (!confirm('Are you sure you want to reset events and alerts database?')) return;
+      await fetch('/api/reset', { method: 'POST' });
+      alert('Database cleared!');
+      fetchStats();
+      fetchAlerts();
+      fetchEvents();
+      fetchChart();
+    }
+
+    function toggleAuthModal() { document.getElementById('authModal').classList.toggle('hidden'); }
+    function toggleRejectedModal() { document.getElementById('rejectedModal').classList.toggle('hidden'); }
+    function toggleHistoryModal() { document.getElementById('historyModal').classList.toggle('hidden'); }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+    }
+
+    // Auto Refresh Loop
+    window.addEventListener('DOMContentLoaded', () => {
+      initChart();
+      checkAuth();
+      fetchStats();
+      fetchChart();
+      fetchAlerts();
+      fetchEvents();
+      fetchConfig();
+
+      setInterval(() => {
+        fetchStats();
+        fetchChart();
+        fetchAlerts();
+      }, 3000);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+# Synthetic mini-corpus for Stage-1 smoke tests (not from Loghub).
+# Mixes LogSentry auth_failure patterns with HDFS-style blk_ IDs so the
+# label join path can be exercised without downloading the full Zenodo set.
+2026-09-12 12:00:01 [INFO] namenode: Receiving block blk_1001 src: /10.0.0.1
+2026-09-12 12:00:02 [ERROR] auth-service: Failed login for user admin blk_1001
+2026-09-12 12:00:02 [ERROR] auth-service: Failed login for user admin blk_1001
+2026-09-12 12:00:02 [ERROR] auth-service: Failed login for user root blk_1001
+2026-09-12 12:00:02 [ERROR] auth-service: Failed login for user guest blk_1001
+2026-09-12 12:00:02 [ERROR] auth-service: Failed login for user operator blk_1001
+2026-09-12 12:00:03 [INFO] namenode: Receiving block blk_2002 src: /10.0.0.2
+2026-09-12 12:00:04 [INFO] datanode: PacketResponder blk_2002 terminating
+2026-09-12 12:00:05 [ERROR] auth-service: Failed login for user alice blk_3003
+2026-09-12 12:00:05 [ERROR] auth-service: Failed login for user bob blk_3003
+2026-09-12 12:00:05 [ERROR] auth-service: Failed login for user carol blk_3003
+2026-09-12 12:00:05 [ERROR] auth-service: Failed login for user dave blk_3003
+2026-09-12 12:00:05 [ERROR] auth-service: Failed login for user eve blk_3003
+2026-09-12 12:00:06 [ERROR] datanode: Got exception while serving block blk_9999 to /10.0.0.9

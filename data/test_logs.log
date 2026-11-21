@@ -1,0 +1,13 @@
+2026-09-12 12:48:00 [INFO] web-server: Server started successfully.
+2026-09-12 12:48:02 [INFO] web-server: Request served in 45ms.
+2026-09-12 12:48:05 [INFO] db-service: Database connection established securely.
+2026-09-12 12:48:07 [INFO] auth-service: Login success for user frank.
+2026-09-12 12:48:10 [ERROR] auth-service: Failed login for user admin
+2026-09-12 12:48:11 [ERROR] auth-service: Failed login for user admin
+2026-09-12 12:48:11 [ERROR] auth-service: Failed login for user root
+2026-09-12 12:48:12 [ERROR] auth-service: Failed login for user admin
+2026-09-12 12:48:13 [ERROR] auth-service: Failed login for user guest
+2026-09-12 12:48:14 [ERROR] auth-service: Failed login for user root
+2026-09-12 12:48:15 [WARN] web-server: Slow response time 900ms detected.
+2026-09-12 12:48:18 [INFO] web-server: Request served in 55ms.
+2026-09-12 12:48:20 [INFO] auth-service: Login success for user sarah.
