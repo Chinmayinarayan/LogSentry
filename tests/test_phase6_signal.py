@@ -210,6 +210,11 @@ def test_admin_permissions(client):
     assert cfg_res.status_code == 200
     assert "hdfs_threshold" in cfg_res.get_json()["updated_keys"]
 
+    # 1b. View config history
+    cfg_hist = client.get("/api/config/history")
+    assert cfg_hist.status_code == 200
+    assert "history" in cfg_hist.get_json()
+
     # 2. View users
     users_res = client.get("/api/users")
     assert users_res.status_code == 200
@@ -243,9 +248,10 @@ def test_operator_permissions(client):
     res_alert = client.post(f"/api/alerts/{aid}/resolve")
     assert res_alert.status_code == 200
 
-    # 2. Forbidden: Modify configuration
+    # 2. Forbidden: Modify configuration or view config history
     res_cfg = client.post("/api/config", json={"hdfs_threshold": "20"})
     assert res_cfg.status_code == 403
+    assert client.get("/api/config/history").status_code == 403
 
     # 3. Forbidden: Manage users
     res_usr = client.post("/api/users", json={"username": "hacker", "password": "p", "role": "ADMIN"})
@@ -278,8 +284,9 @@ def test_viewer_read_only_restrictions(client):
     aid = db.save_alert("hdfs", "BURST", 5, 60)
     assert client.post(f"/api/alerts/{aid}/resolve").status_code == 403
 
-    # 3. Forbidden: Update config
+    # 3. Forbidden: Update config or view config history
     assert client.post("/api/config", json={"hdfs_window": "30"}).status_code == 403
+    assert client.get("/api/config/history").status_code == 403
 
     # 4. Forbidden: Create users
     assert client.post("/api/users", json={"username": "u", "password": "p", "role": "ADMIN"}).status_code == 403
@@ -300,6 +307,7 @@ def test_unauthorized_access_rejection(client):
 
     assert client.post(f"/api/alerts/{aid}/resolve").status_code == 401
     assert client.post("/api/config", json={"hdfs_threshold": "10"}).status_code == 401
+    assert client.get("/api/config/history").status_code == 401
     assert client.get("/api/users").status_code == 401
     assert client.post("/api/users", json={"username": "u", "password": "p", "role": "ADMIN"}).status_code == 401
     assert client.post("/api/ingest/live/start", json={"source": "hdfs", "file_path": "/tmp/a.log"}).status_code == 401
