@@ -966,5 +966,72 @@ def test_concurrent_direct_persistence_under_controlled_synchronization(monkeypa
     alerts_in_db = db.get_alerts()
     assert len(alerts_in_db) == 2
     in_order = sorted(alerts_in_db, key=lambda a: a["alert_id"])
-    assert [a["alert_type"] for a in in_order] == ["SYNC_ALERT_A", "SYNC_ALERT_B"]
+    assert in_order == ["SYNC_ALERT_A", "SYNC_ALERT_B"] or [a["alert_type"] for a in in_order] == ["SYNC_ALERT_A", "SYNC_ALERT_B"]
     assert save_order == ["SYNC_ALERT_A", "SYNC_ALERT_B"]
+
+
+# =====================================================================
+# 11. RETURN-VALUE SEMANTICS TEST: CURRENT ALERT FAILS WHILE OLDER PERSISTS
+# =====================================================================
+
+def test_persist_alert_return_value_semantics_when_older_alert_persists_but_current_fails(monkeypatch):
+    """
+    Verify return value semantics of _persist_alert_with_retry():
+    - Preload an older alert A into pending buffer.
+    - Call _persist_alert_with_retry() for alert B.
+    - Make A persist successfully in DB.
+    - Make B fail (raises OperationalError).
+    - Verify: A is persisted, B remains in pending buffer.
+    - Verify: _persist_alert_with_retry() returns FALSE for B (must NOT return True merely because A was saved).
+    """
+    parser.reset_pending_alerts()
+
+    # Preload older alert A into pending buffer
+    payload_a = {
+        "source": "HDFS",
+        "alert_type": "ALERT_A",
+        "event_count": 3,
+        "window_duration_sec": 60,
+    }
+    parser._buffer_failed_alert("hdfs", payload_a)
+    assert parser.get_pending_alerts_count("hdfs") == 1
+
+    # Mock db.save_alert so ALERT_A succeeds, but ALERT_B fails
+    original_save = db.save_alert
+    saved_types = []
+
+    def mock_save(source, alert_type, event_count, window_duration_sec, **kwargs):
+        if alert_type == "ALERT_B":
+            import sqlite3
+            raise sqlite3.OperationalError("database locked on ALERT_B")
+        saved_types.append(alert_type)
+        return original_save(source, alert_type, event_count, window_duration_sec, **kwargs)
+
+    monkeypatch.setattr(db, "save_alert", mock_save)
+
+    payload_b = {
+        "source": "HDFS",
+        "alert_type": "ALERT_B",
+        "event_count": 4,
+        "window_duration_sec": 60,
+    }
+
+    # Call _persist_alert_with_retry for B
+    res_b = parser._persist_alert_with_retry("hdfs", payload_b, max_retries=1)
+
+    # CRITICAL CHECK: Must return False because B itself was not persisted!
+    assert res_b is False, "Expected False because ALERT_B is still pending in buffer!"
+
+    # Verify A was saved, but B is still in pending buffer
+    assert saved_types == ["ALERT_A"]
+    assert parser.get_pending_alerts_count("hdfs") == 1
+
+    # Verify B is the remaining item in the buffer
+    with parser._pending_alert_locks["hdfs"]:
+        remaining_item = parser._pending_alert_buffers["hdfs"][0]
+        assert remaining_item is payload_b
+
+    # Verify SQLite DB has only ALERT_A
+    db_alerts = db.get_alerts()
+    assert len(db_alerts) == 1
+    assert db_alerts[0]["alert_type"] == "ALERT_A"

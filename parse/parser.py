@@ -243,8 +243,13 @@ def _persist_alert_with_retry(cat: str, alert_payload: dict, max_retries: int = 
     if not buffered:
         return False
 
-    flushed = _flush_pending_alerts_for_source(cat, max_retries=max_retries, backoff_base=backoff_base)
-    return flushed > 0
+    _flush_pending_alerts_for_source(cat, max_retries=max_retries, backoff_base=backoff_base)
+
+    # Return True if and only if alert_payload itself was successfully persisted to database
+    with _pending_alert_locks[cat]:
+        is_still_pending = any(item is alert_payload for item in _pending_alert_buffers[cat])
+
+    return not is_still_pending
 
 
 def refresh_config_cache():
