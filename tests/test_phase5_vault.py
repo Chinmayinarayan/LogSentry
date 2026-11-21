@@ -544,3 +544,129 @@ def test_e4_query_interfaces_integration():
     assert len(ts["labels"]) >= 3  # '2026-11-21 10:00', '2026-11-21 10:01', '2026-11-21 10:02'
     assert sum(ts["events"]) == 5
     assert sum(ts["errors"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# 15. Transaction Atomicity: Audit Failure Rolls Back Primary Operation
+# ---------------------------------------------------------------------------
+
+def test_transaction_atomicity_audit_failure_rolls_back_primary_operation():
+    """Verify that if audit history recording fails, the primary operation is atomically rolled back."""
+    invalid_admin_id = 999999
+
+    # 1. User Creation: failure in audit log rolls back user table insertion
+    with pytest.raises(sqlite3.IntegrityError):
+        db.create_or_update_user("ghost_user", "Secr3t!", "OPERATOR", admin_id=invalid_admin_id)
+    assert db.get_user_by_username("ghost_user") is None
+
+    # 2. Config Update: failure in audit log rolls back config table update
+    orig_val = db.get_all_configs()["hdfs_window"]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.update_config("hdfs_window", "999", user_id=invalid_admin_id)
+    assert db.get_all_configs()["hdfs_window"] == orig_val
+
+    # 3. Alert Resolution: failure in audit log rolls back alert resolution
+    aid = db.save_alert("hdfs", "ANOMALY_BURST", 5, 60)
+    with pytest.raises(sqlite3.IntegrityError):
+        db.resolve_alert(aid, user_id=invalid_admin_id)
+    alerts = db.get_alerts(status="ACTIVE")
+    assert any(a["alert_id"] == aid for a in alerts)
+
+
+# ---------------------------------------------------------------------------
+# 16. Concurrent Readers and Writers under WAL Mode
+# ---------------------------------------------------------------------------
+
+def test_concurrent_readers_and_writers_wal_mode():
+    """Verify that WAL mode permits non-blocking concurrent reads while writers synchronize safely."""
+    # Seed initial data
+    for i in range(10):
+        db.save_event("hdfs", "INFO", f"host_{i}", f"Pre-seed event {i}")
+
+    barrier = threading.Barrier(10)
+    errors = []
+
+    def reader_worker(idx):
+        try:
+            barrier.wait()
+            for _ in range(20):
+                evs = db.get_events(limit=10)
+                assert evs["total"] >= 10
+                stats = db.get_event_stats()
+                assert stats["total_events"] >= 10
+        except Exception as ex:
+            errors.append(ex)
+
+    def writer_worker(idx):
+        try:
+            barrier.wait()
+            for i in range(10):
+                db.save_event("hdfs", "WARN", f"host_w{idx}", f"Live concurrent event {idx}_{i}")
+                if i % 3 == 0:
+                    db.save_alert("hdfs", "BURST", i + 1, 60)
+        except Exception as ex:
+            errors.append(ex)
+
+    threads = []
+    # 5 concurrent reader threads
+    for i in range(5):
+        t = threading.Thread(target=reader_worker, args=(i,))
+        threads.append(t)
+    # 5 concurrent writer threads
+    for i in range(5):
+        t = threading.Thread(target=writer_worker, args=(i,))
+        threads.append(t)
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15.0)
+
+    assert len(errors) == 0, f"Reader/writer concurrency errors under WAL: {errors}"
+
+
+# ---------------------------------------------------------------------------
+# 17. User Password Update Audit Trail
+# ---------------------------------------------------------------------------
+
+def test_user_password_update_audit_trail():
+    """Verify that updating user credentials records audit entry without leaking secrets."""
+    admin = db.get_user_by_username("admin")
+    uid = db.create_or_update_user("analyst_clara", "InitialP@ss1", "VIEWER", admin_id=admin["user_id"])
+
+    # Update password
+    db.create_or_update_user("analyst_clara", "UpdatedP@ss2!", "VIEWER", admin_id=admin["user_id"])
+
+    # Verify authentication works with new password and fails with old
+    user = db.get_user_by_id(uid)
+    assert check_password_hash(user["password_hash"], "UpdatedP@ss2!")
+    assert not check_password_hash(user["password_hash"], "InitialP@ss1")
+
+    # Verify audit history
+    audit = db.get_audit_history(table_name="users")
+    pwd_records = [h for h in audit if h["record_id"] == uid and h["field_changed"] == "password_updated"]
+    assert len(pwd_records) == 1
+    rec = pwd_records[0]
+    assert rec["new_value"] == "[UPDATED]"  # Hash and plain password are not leaked in audit
+    assert rec["changed_by"] == admin["user_id"]
+    assert rec["changed_by_name"] == "admin"
+
+
+# ---------------------------------------------------------------------------
+# 18. Deadlock Free Lock Acquisition Order
+# ---------------------------------------------------------------------------
+
+def test_no_recursive_lock_deadlock_across_vault_operations():
+    """Verify that rapid interleaved calls across all database operations execute without deadlock."""
+    admin = db.get_user_by_username("admin")
+
+    # Sequence of rapid mixed operations
+    eid = db.save_event("hdfs", "INFO", "h1", "Msg")
+    aid = db.save_alert("hdfs", "BURST", 5, 60)
+    db.resolve_alert(aid, user_id=admin["user_id"])
+    db.update_config("hdfs_threshold", "10", user_id=admin["user_id"])
+    rid = db.save_rejected_line("hdfs", "REASON", b"data")
+    hid = db.record_audit_event("custom", 1, "ACTION", old_value="A", new_value="B", changed_by=admin["user_id"])
+
+    assert eid > 0 and aid > 0 and rid > 0 and hid > 0
+

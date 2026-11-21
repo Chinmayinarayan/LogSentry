@@ -32,120 +32,121 @@ def get_db_connection():
 
 def init_db():
     """Create all 6 required tables and indexes, and populate default seed data."""
-    conn = get_db_connection()
-    schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
-    try:
-        with conn:
-            conn.execute("PRAGMA journal_mode = WAL;")
-            if os.path.exists(schema_path):
-                with open(schema_path, "r", encoding="utf-8") as f:
-                    conn.executescript(f.read())
-            else:
-                conn.executescript(
-                    """
-                    PRAGMA journal_mode = WAL;
-                    PRAGMA foreign_keys = ON;
-                    PRAGMA busy_timeout = 30000;
+    with _lock:
+        conn = get_db_connection()
+        schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+        try:
+            with conn:
+                conn.execute("PRAGMA journal_mode = WAL;")
+                if os.path.exists(schema_path):
+                    with open(schema_path, "r", encoding="utf-8") as f:
+                        conn.executescript(f.read())
+                else:
+                    conn.executescript(
+                        """
+                        PRAGMA journal_mode = WAL;
+                        PRAGMA foreign_keys = ON;
+                        PRAGMA busy_timeout = 30000;
 
-                    CREATE TABLE IF NOT EXISTS users (
-                        user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        username TEXT UNIQUE NOT NULL,
-                        password_hash TEXT NOT NULL,
-                        role TEXT CHECK(role IN ('ADMIN','OPERATOR','VIEWER')) NOT NULL,
-                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                    );
+                        CREATE TABLE IF NOT EXISTS users (
+                            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            username TEXT UNIQUE NOT NULL,
+                            password_hash TEXT NOT NULL,
+                            role TEXT CHECK(role IN ('ADMIN','OPERATOR','VIEWER')) NOT NULL,
+                            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                        );
 
-                    CREATE TABLE IF NOT EXISTS events (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp DATETIME NOT NULL,
-                        source TEXT NOT NULL,
-                        log_level TEXT NOT NULL,
-                        component_host TEXT,
-                        raw_message TEXT NOT NULL
-                    );
+                        CREATE TABLE IF NOT EXISTS events (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp DATETIME NOT NULL,
+                            source TEXT NOT NULL,
+                            log_level TEXT NOT NULL,
+                            component_host TEXT,
+                            raw_message TEXT NOT NULL
+                        );
 
-                    CREATE TABLE IF NOT EXISTS alerts (
-                        alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp DATETIME NOT NULL,
-                        source TEXT NOT NULL,
-                        alert_type TEXT NOT NULL,
-                        event_count INT NOT NULL,
-                        window_duration_sec INT NOT NULL,
-                        status TEXT DEFAULT 'ACTIVE',
-                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        updated_by INTEGER REFERENCES users(user_id)
-                    );
+                        CREATE TABLE IF NOT EXISTS alerts (
+                            alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp DATETIME NOT NULL,
+                            source TEXT NOT NULL,
+                            alert_type TEXT NOT NULL,
+                            event_count INT NOT NULL,
+                            window_duration_sec INT NOT NULL,
+                            status TEXT DEFAULT 'ACTIVE',
+                            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            updated_by INTEGER REFERENCES users(user_id)
+                        );
 
-                    CREATE TABLE IF NOT EXISTS config (
-                        key TEXT PRIMARY KEY,
-                        value TEXT NOT NULL,
-                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        updated_by INTEGER REFERENCES users(user_id)
-                    );
+                        CREATE TABLE IF NOT EXISTS config (
+                            key TEXT PRIMARY KEY,
+                            value TEXT NOT NULL,
+                            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            updated_by INTEGER REFERENCES users(user_id)
+                        );
 
-                    CREATE TABLE IF NOT EXISTS history (
-                        history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        table_name TEXT NOT NULL,
-                        record_id INTEGER NOT NULL,
-                        field_changed TEXT NOT NULL,
-                        old_value TEXT,
-                        new_value TEXT,
-                        changed_by INTEGER REFERENCES users(user_id),
-                        changed_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                    );
+                        CREATE TABLE IF NOT EXISTS history (
+                            history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            table_name TEXT NOT NULL,
+                            record_id INTEGER NOT NULL,
+                            field_changed TEXT NOT NULL,
+                            old_value TEXT,
+                            new_value TEXT,
+                            changed_by INTEGER REFERENCES users(user_id),
+                            changed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                        );
 
-                    CREATE TABLE IF NOT EXISTS rejected_lines (
-                        rejected_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp DATETIME NOT NULL,
-                        source TEXT NOT NULL,
-                        reason TEXT NOT NULL,
-                        raw_bytes BLOB NOT NULL
-                    );
+                        CREATE TABLE IF NOT EXISTS rejected_lines (
+                            rejected_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp DATETIME NOT NULL,
+                            source TEXT NOT NULL,
+                            reason TEXT NOT NULL,
+                            raw_bytes BLOB NOT NULL
+                        );
 
-                    CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
-                    CREATE INDEX IF NOT EXISTS idx_events_level ON events(log_level);
-                    CREATE INDEX IF NOT EXISTS idx_events_source ON events(source);
-                    CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp);
-                    CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
-                    CREATE INDEX IF NOT EXISTS idx_history_record ON history(table_name, record_id);
-                    CREATE INDEX IF NOT EXISTS idx_rejected_source ON rejected_lines(source);
-                    """
-                )
+                        CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+                        CREATE INDEX IF NOT EXISTS idx_events_level ON events(log_level);
+                        CREATE INDEX IF NOT EXISTS idx_events_source ON events(source);
+                        CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp);
+                        CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+                        CREATE INDEX IF NOT EXISTS idx_history_record ON history(table_name, record_id);
+                        CREATE INDEX IF NOT EXISTS idx_rejected_source ON rejected_lines(source);
+                        """
+                    )
 
-            # Seed default users if empty
-            cur = conn.execute("SELECT COUNT(*) AS c FROM users")
-            if cur.fetchone()["c"] == 0:
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                admin_hash = generate_password_hash("adminpassword")
-                operator_hash = generate_password_hash("operatorpassword")
-                viewer_hash = generate_password_hash("viewerpassword")
-                conn.execute(
-                    "INSERT INTO users (username, password_hash, role, updated_at) VALUES (?, ?, ?, ?)",
-                    ("admin", admin_hash, "ADMIN", now),
-                )
-                conn.execute(
-                    "INSERT INTO users (username, password_hash, role, updated_at) VALUES (?, ?, ?, ?)",
-                    ("operator", operator_hash, "OPERATOR", now),
-                )
-                conn.execute(
-                    "INSERT INTO users (username, password_hash, role, updated_at) VALUES (?, ?, ?, ?)",
-                    ("viewer", viewer_hash, "VIEWER", now),
-                )
+                # Seed default users if empty
+                cur = conn.execute("SELECT COUNT(*) AS c FROM users")
+                if cur.fetchone()["c"] == 0:
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    admin_hash = generate_password_hash("adminpassword")
+                    operator_hash = generate_password_hash("operatorpassword")
+                    viewer_hash = generate_password_hash("viewerpassword")
+                    conn.execute(
+                        "INSERT INTO users (username, password_hash, role, updated_at) VALUES (?, ?, ?, ?)",
+                        ("admin", admin_hash, "ADMIN", now),
+                    )
+                    conn.execute(
+                        "INSERT INTO users (username, password_hash, role, updated_at) VALUES (?, ?, ?, ?)",
+                        ("operator", operator_hash, "OPERATOR", now),
+                    )
+                    conn.execute(
+                        "INSERT INTO users (username, password_hash, role, updated_at) VALUES (?, ?, ?, ?)",
+                        ("viewer", viewer_hash, "VIEWER", now),
+                    )
 
-            # Seed default config values
-            default_configs = {
-                "hdfs_window": "60",
-                "hdfs_threshold": "5",
-                "nasa_http_window": "60",
-                "nasa_http_threshold": "5",
-            }
-            for k, v in default_configs.items():
-                conn.execute(
-                    "INSERT OR IGNORE INTO config (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                    (k, v),
-                )
-    finally:
-        conn.close()
+                # Seed default config values
+                default_configs = {
+                    "hdfs_window": "60",
+                    "hdfs_threshold": "5",
+                    "nasa_http_window": "60",
+                    "nasa_http_threshold": "5",
+                }
+                for k, v in default_configs.items():
+                    conn.execute(
+                        "INSERT OR IGNORE INTO config (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                        (k, v),
+                    )
+        finally:
+            conn.close()
 
 
 # --- USER MANAGEMENT ---
@@ -202,11 +203,24 @@ def create_or_update_user(username, password, role, admin_id=None):
                         )
                     user_id = existing["user_id"]
                     if admin_id:
-                        conn.execute(
-                            "INSERT INTO history (table_name, record_id, field_changed, old_value, new_value, changed_by, changed_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            ("users", user_id, "role", old_role, role, admin_id, now),
-                        )
+                        if old_role != role:
+                            conn.execute(
+                                "INSERT INTO history (table_name, record_id, field_changed, old_value, new_value, changed_by, changed_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                ("users", user_id, "role", old_role, role, admin_id, now),
+                            )
+                        elif not pwd_hash:
+                            conn.execute(
+                                "INSERT INTO history (table_name, record_id, field_changed, old_value, new_value, changed_by, changed_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                ("users", user_id, "role", old_role, role, admin_id, now),
+                            )
+                        if pwd_hash:
+                            conn.execute(
+                                "INSERT INTO history (table_name, record_id, field_changed, old_value, new_value, changed_by, changed_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                ("users", user_id, "password_updated", None, "[UPDATED]", admin_id, now),
+                            )
                 else:
                     if not pwd_hash:
                         raise ValueError("Password is required for new user")
@@ -275,9 +289,10 @@ def get_config_history(limit=100):
         conn.close()
 
 
-def record_audit_event(table_name, record_id, field_changed, old_value=None, new_value=None, changed_by=None):
-    """Explicitly record an audit event to the immutable history table."""
+def record_audit_event(table_name, record_id=0, field_changed="", old_value=None, new_value=None, changed_by=None):
+    """Explicitly record an audit event to the append-only history table."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rec_id = int(record_id) if record_id is not None else 0
     with _lock:
         conn = get_db_connection()
         try:
@@ -287,7 +302,7 @@ def record_audit_event(table_name, record_id, field_changed, old_value=None, new
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         table_name,
-                        record_id,
+                        rec_id,
                         field_changed,
                         str(old_value) if old_value is not None else None,
                         str(new_value) if new_value is not None else None,
