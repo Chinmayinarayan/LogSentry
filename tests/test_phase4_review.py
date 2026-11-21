@@ -173,3 +173,134 @@ def test_identical_timestamps_counted_in_burst():
     alerts = db.get_alerts()
     assert len(alerts) == 1
     assert alerts[0]["event_count"] == 3
+
+
+# =====================================================================
+# 5. OVERSIZED RECORD FOLLOWED BY VALID LINE TEST
+# =====================================================================
+
+def test_oversized_line_followed_by_valid_line():
+    """
+    Verify:
+    1. An oversized line (>64KB) is detected and rejected.
+    2. The remaining bytes of the oversized line are completely discarded.
+    3. The subsequent valid log line is processed cleanly and placed in the queue.
+    """
+    huge_line = "081109 203518 143 INFO dfs.DataNode: " + ("Z" * 70000) + "\n"
+    valid_line = "081109 203519 144 INFO dfs.DataNode: Valid normal log line\n"
+
+    fd, path = tempfile.mkstemp(suffix=".log")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(huge_line)
+            f.write(valid_line)
+
+        res = tailer.ingest_file_path("hdfs", path)
+        assert res["status"] == "success"
+
+        # The oversized line was rejected; exactly 1 line (the valid one) was enqueued
+        assert tailer.log_queue.qsize() == 1
+        source, queued_line = tailer.log_queue.get_nowait()
+        assert source == "hdfs"
+        assert queued_line == "081109 203519 144 INFO dfs.DataNode: Valid normal log line"
+
+        # Verify oversized line was recorded in rejected_lines
+        rejected = db.get_rejected_lines()
+        assert len(rejected) >= 1
+        assert any("Oversized" in r["reason"] or "OVERSIZED" in str(r.get("raw_bytes_preview", "")) for r in rejected)
+
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+# =====================================================================
+# 6. EXACT SLIDING WINDOW EVENT-TIME SEMANTICS SEQUENCE TEST
+# =====================================================================
+
+def test_sliding_window_sequence_exact_semantics():
+    """
+    Test sequence with W = 60 seconds, threshold = 5:
+    1. Event at t=100 -> count = 1 [100]
+    2. Event at t=90  -> count = 2 [90, 100] (in window [40, 100])
+    3. Event at t=50  -> count = 3 [50, 90, 100] (in window [40, 100])
+    4. Event at t=101 -> count = 4 [50, 90, 100, 101] (in window [41, 101])
+    All 4 events remain in window.
+    5. Event at t=170 -> count = 1 [170] (170 - 101 = 69 > 60, all prior evicted)
+    6. Delayed event at t=105 arrives -> Stale (105 < 170 - 60 = 110), dropped, count remains 1
+    """
+    db.update_config("hdfs_window", "60", user_id=1)
+    db.update_config("hdfs_threshold", "5", user_id=1)
+    parser.refresh_config_cache()
+
+    # Step 1: t=100
+    parser._check_sliding_window("hdfs", 100.0, "Anomaly 1")
+    stats = parser.get_sliding_window_stats()
+    assert stats["hdfs"]["current_count"] == 1
+
+    # Step 2: t=90 (out of order, within window [40, 100])
+    parser._check_sliding_window("hdfs", 90.0, "Anomaly 2")
+    stats = parser.get_sliding_window_stats()
+    assert stats["hdfs"]["current_count"] == 2
+
+    # Step 3: t=50 (out of order, within window [40, 100])
+    parser._check_sliding_window("hdfs", 50.0, "Anomaly 3")
+    stats = parser.get_sliding_window_stats()
+    assert stats["hdfs"]["current_count"] == 3
+
+    # Step 4: t=101 (in order, advances T_max to 101, window [41, 101], 101-50=51 <= 60)
+    parser._check_sliding_window("hdfs", 101.0, "Anomaly 4")
+    stats = parser.get_sliding_window_stats()
+    assert stats["hdfs"]["current_count"] == 4
+
+    # Step 5: t=170 (advances T_max to 170, window [110, 170], evicts all previous)
+    parser._check_sliding_window("hdfs", 170.0, "Anomaly 5")
+    stats = parser.get_sliding_window_stats()
+    assert stats["hdfs"]["current_count"] == 1
+
+    # Step 6: Delayed event at t=105 arrives (stale, 105 < 110)
+    parser._check_sliding_window("hdfs", 105.0, "Anomaly Stale")
+    stats = parser.get_sliding_window_stats()
+    assert stats["hdfs"]["current_count"] == 1
+
+
+# =====================================================================
+# 7. ZIP PATH TRAVERSAL COMPREHENSIVE SECURITY TEST
+# =====================================================================
+
+def test_zip_path_security_traversal_all_variants():
+    """
+    Verify rejection of malicious paths and acceptance of valid relative nested paths.
+    """
+    # Malicious paths that must be rejected
+    malicious_paths = [
+        "../../etc/passwd.log",
+        "/etc/passwd.log",
+        "C:\\Windows\\system32\\cmd.log",
+        "..\\..\\etc\\passwd.log",
+        "\\\\server\\share\\evil.log",
+        "//server/share/evil.log",
+    ]
+    for p in malicious_paths:
+        assert tailer.is_safe_zip_path(p) is False, f"Expected unsafe for: {p}"
+
+    # Legitimate paths that must be permitted
+    safe_paths = [
+        "hdfs.log",
+        "logs/hdfs.log",
+        "nested/dir/access_log.txt",
+    ]
+    for p in safe_paths:
+        assert tailer.is_safe_zip_path(p) is True, f"Expected safe for: {p}"
+
+    # Test actual ZIP ingestion with valid nested path logs/hdfs.log
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("logs/hdfs.log", "081109 203518 143 INFO dfs.DataNode: In nested zip\n")
+    zip_bytes = buf.getvalue()
+
+    res = tailer.ingest_file_stream("hdfs", zip_bytes, filename="safe_nested.zip")
+    assert res["status"] == "success"
+    assert res["lines_queued"] == 1
+    assert tailer.log_queue.qsize() == 1

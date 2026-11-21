@@ -123,11 +123,15 @@ def _check_sliding_window(source_category, epoch_timestamp, raw_message):
     """
     Time-based sliding window anomaly detection using collections.deque.
     FR-06, NFR-04:
+    - Window Reference: Event-Time anchored to the latest observed event timestamp T_max.
+      Active interval is [T_max - W, T_max].
+    - In-order insertion is O(1) via deque.append().
+    - Out-of-order insertion uses bisect.insort (O(N) for collections.deque).
+    - Eviction: Removes events where (T_max - timestamp) > W.
+    - An older event cannot evict a newer event; stale events (t < T_max - W) are ignored.
     - Maintains independent window deques and independent locks for HDFS and NASA-HTTP.
-    - Evicts timestamps older than window W: O(1) amortized eviction.
-    - Handles out-of-order timestamps via sorted insertion.
-    - Moves database writes OUTSIDE the critical section to prevent lock contention.
-    - Fires alert if count reaches threshold T.
+    - Database writes occur outside the critical section to avoid lock contention.
+    - Fires alert if event count in active window reaches threshold T.
     """
     cat = "hdfs" if "hdfs" in source_category.lower() else "nasa_http"
     lock = _source_window_locks.get(cat, _window_lock)
@@ -146,15 +150,25 @@ def _check_sliding_window(source_category, epoch_timestamp, raw_message):
         window_deque = _sliding_windows[cat]
         now_ts = epoch_timestamp if epoch_timestamp else time.time()
 
-        # Handle in-order and out-of-order timestamps
+        # Check if incoming out-of-order event is stale (older than T_max - W)
+        if window_deque:
+            t_max = window_deque[-1]
+            if now_ts < (t_max - window_sec):
+                # Stale event: already expired relative to current active window
+                return False
+
+        # In-order events (monotonic, 99%+ of logs) append in O(1).
+        # Out-of-order events insert in sorted order via bisect.insort (O(N) in collections.deque).
         if not window_deque or now_ts >= window_deque[-1]:
             window_deque.append(now_ts)
         else:
             import bisect
             bisect.insort(window_deque, now_ts)
 
-        # Evict timestamps left of window: timestamp < now - W
-        while window_deque and (now_ts - window_deque[0]) > window_sec:
+        # Evict timestamps older than active window [T_max - W, T_max]
+        # Because window_deque is kept strictly sorted, window_deque[-1] is always T_max.
+        current_t_max = window_deque[-1]
+        while window_deque and (current_t_max - window_deque[0]) > window_sec:
             window_deque.popleft()
 
         # Trigger alert if threshold reached
@@ -168,14 +182,17 @@ def _check_sliding_window(source_category, epoch_timestamp, raw_message):
             }
             window_deque.clear()
 
-    # Move DB write OUTSIDE the critical section (Fix for Check 3)
+    # Move DB write OUTSIDE the critical section (Fix for Check 3) with exception safety
     if should_fire and alert_payload:
-        db.save_alert(
-            source=alert_payload["source"],
-            alert_type=alert_payload["alert_type"],
-            event_count=alert_payload["event_count"],
-            window_duration_sec=alert_payload["window_duration_sec"],
-        )
+        try:
+            db.save_alert(
+                source=alert_payload["source"],
+                alert_type=alert_payload["alert_type"],
+                event_count=alert_payload["event_count"],
+                window_duration_sec=alert_payload["window_duration_sec"],
+            )
+        except Exception as exc:
+            print(f"[_check_sliding_window] Error saving alert: {exc}")
         return True
     return False
 
@@ -192,6 +209,14 @@ def parse_line(line, declared_source="hdfs"):
         return None
 
     raw_bytes = line if isinstance(line, bytes) else line.encode("utf-8", errors="replace")
+
+    if b"OVERSIZED_RECORD" in raw_bytes:
+        db.save_rejected_line(declared_source, "Oversized record: Line exceeds 64KB limit", raw_bytes)
+        return None
+
+    if b"SECURITY_VIOLATION" in raw_bytes:
+        db.save_rejected_line(declared_source, "Security violation: Directory traversal detected in path", raw_bytes)
+        return None
 
     if b"\x00" in raw_bytes:
         db.save_rejected_line(declared_source, "Binary or null-byte data detected", raw_bytes)

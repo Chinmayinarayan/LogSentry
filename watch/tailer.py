@@ -27,6 +27,77 @@ log_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
 # With QUEUE_MAXSIZE=10,000, worst-case memory ceiling for the queue buffer is <= 640 MB.
 MAX_RECORD_SIZE = 65536
 
+
+def is_safe_zip_path(path: str) -> bool:
+    r"""
+    Verify whether a ZIP member path is a safe relative path.
+    Rejects:
+    - Directory traversal ('..' components, e.g. '../../etc/passwd', r'..\..\file')
+    - Absolute Unix paths (starts with '/')
+    - Windows drive letters (e.g. 'C:', 'D:\...')
+    - UNC network share paths (e.g. r'\\server\share\file' or '//server/share/file')
+    - Null bytes or control characters in path
+    Permits:
+    - Safe relative filenames (e.g. 'hdfs.log')
+    - Safe nested relative paths (e.g. 'logs/hdfs.log', 'nested/dir/app.log')
+    """
+    if not path or not isinstance(path, str):
+        return False
+    if "\x00" in path:
+        return False
+    # Check for UNC network share prefix
+    if path.startswith("\\\\") or path.startswith("//"):
+        return False
+    # Check Windows drive letter (e.g. C:, D:)
+    if len(path) >= 2 and path[1] == ":" and path[0].isalpha():
+        return False
+    # Normalize slashes
+    norm = path.replace("\\", "/")
+    if norm.startswith("/"):
+        return False
+    if ":" in norm:
+        return False
+    # Check path components
+    parts = [p for p in norm.split("/") if p]
+    if ".." in parts:
+        return False
+    return True
+
+
+def _safe_readline(stream: Any, max_size: int = MAX_RECORD_SIZE):
+    """
+    Safely reads a single line up to max_size characters/bytes.
+
+    If the line exceeds max_size without a terminating newline, discards the remainder
+    in 8KB chunks until a newline ('\\n' or '\\r') or EOF is encountered.
+    This prevents memory exhaustion from giant lines and ensures the remainder is not
+    accidentally parsed as a subsequent log line.
+
+    Returns:
+        (line_str_or_bytes, is_oversized)
+        - If EOF: ("", False) or (b"", False)
+        - If valid line: (line_content, False)
+        - If oversized line: (preview, True)
+    """
+    line = stream.readline(max_size + 1)
+    if not line:
+        return ("", False)
+
+    is_binary = isinstance(line, bytes)
+    newline_chars = (b"\n", b"\r") if is_binary else ("\n", "\r")
+
+    if len(line) > max_size:
+        # Line exceeds max_size. Discard remaining chunks until next newline or EOF.
+        while True:
+            chunk = stream.readline(8192)
+            if not chunk:
+                break
+            if any(nc in chunk for nc in newline_chars):
+                break
+        return (line[:512], True)
+
+    return (line, False)
+
 # Thread synchronization primitives (NFR-02)
 _events_processed = 0
 _events_lock = threading.Lock()
@@ -98,12 +169,11 @@ def worker_thread(source_name: str, file_path: str, stop_event: threading.Event)
         with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
             fh.seek(0, os.SEEK_END)
             while not stop_event.is_set():
-                line = fh.readline(MAX_RECORD_SIZE + 1)
+                line, is_oversized = _safe_readline(fh, MAX_RECORD_SIZE)
+                if is_oversized:
+                    parser.parse_line(b"OVERSIZED_RECORD: Line exceeds 64KB limit", declared_source=source_name)
+                    continue
                 if line:
-                    if len(line) > MAX_RECORD_SIZE:
-                        parser.parse_line(b"OVERSIZED_RECORD: Line exceeds 64KB limit", declared_source=source_name)
-                        fh.readline()  # Flush remainder of oversized line
-                        continue
                     clean_line = line.rstrip("\r\n")
                     if clean_line:
                         # Non-blocking backpressure: blocks up to 0.2s then checks stop_event
@@ -215,9 +285,7 @@ def _ingest_zip_container(source_name: str, stream: Any, filename: str = "") -> 
 
             # Security: Path traversal protection
             for m in members:
-                normalized = m.replace("\\", "/")
-                parts = normalized.split("/")
-                if ".." in parts or normalized.startswith("/") or ":" in normalized:
+                if not is_safe_zip_path(m):
                     parser.parse_line(f"SECURITY_VIOLATION: Directory traversal path in ZIP: {m}".encode("utf-8"), declared_source=source_name)
                     return {"status": "error", "message": f"Security restriction: Directory traversal detected in ZIP member '{m}'"}
 
@@ -240,10 +308,13 @@ def _ingest_zip_container(source_name: str, stream: Any, filename: str = "") -> 
             for member in log_members:
                 with zf.open(member, "r") as member_file:
                     text_stream = io.TextIOWrapper(member_file, encoding="utf-8", errors="replace")
-                    for line in text_stream:
-                        if len(line) > MAX_RECORD_SIZE:
+                    while True:
+                        line, is_oversized = _safe_readline(text_stream, MAX_RECORD_SIZE)
+                        if is_oversized:
                             parser.parse_line(b"OVERSIZED_RECORD: Line in ZIP exceeds 64KB limit", declared_source=source_name)
                             continue
+                        if not line:
+                            break
                         clean_line = line.rstrip("\r\n")
                         if clean_line:
                             log_queue.put((source_name, clean_line))
@@ -283,10 +354,13 @@ def _ingest_text_stream(source_name: str, stream: Any) -> Dict[str, Any]:
             text_stream = stream
 
         processed_count = 0
-        for line in text_stream:
-            if len(line) > MAX_RECORD_SIZE:
+        while True:
+            line, is_oversized = _safe_readline(text_stream, MAX_RECORD_SIZE)
+            if is_oversized:
                 parser.parse_line(b"OVERSIZED_RECORD: Line exceeds 64KB limit", declared_source=source_name)
                 continue
+            if not line:
+                break
             clean_line = line.rstrip("\r\n")
             if clean_line and not clean_line.startswith("#"):
                 log_queue.put((source_name, clean_line))
@@ -315,10 +389,13 @@ def ingest_file_path(source_name: str, file_path: str) -> Dict[str, Any]:
     processed_count = 0
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if len(line) > MAX_RECORD_SIZE:
+            while True:
+                line, is_oversized = _safe_readline(f, MAX_RECORD_SIZE)
+                if is_oversized:
                     parser.parse_line(b"OVERSIZED_RECORD: Line exceeds 64KB limit", declared_source=source_name)
                     continue
+                if not line:
+                    break
                 clean_line = line.rstrip("\r\n")
                 if clean_line and not clean_line.startswith("#"):
                     log_queue.put((source_name, clean_line))
