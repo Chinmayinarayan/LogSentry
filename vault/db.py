@@ -6,8 +6,19 @@ import threading
 from datetime import datetime
 from werkzeug.security import generate_password_hash, check_password_hash
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "logsentry.db")
+DB_PATH = os.environ.get("LOGSENTRY_DB_PATH", os.path.join(os.path.dirname(__file__), "logsentry.db"))
 _lock = threading.Lock()
+
+
+def set_db_path(path: str):
+    """Set active database path dynamically (used for test isolation)."""
+    global DB_PATH
+    DB_PATH = path
+
+
+def get_db_path() -> str:
+    """Return the active database path."""
+    return DB_PATH
 
 
 def get_db_connection():

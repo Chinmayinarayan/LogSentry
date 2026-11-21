@@ -159,7 +159,9 @@ class QuarantineRecord:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "QuarantineRecord":
         """Construct QuarantineRecord from dictionary."""
-        raw = data.get("raw_bytes", b"")
+        raw = data.get("raw_bytes")
+        if raw is None:
+            raw = data.get("raw_bytes_preview", b"")
         if isinstance(raw, str):
             raw = raw.encode("utf-8", errors="replace")
         return cls(
