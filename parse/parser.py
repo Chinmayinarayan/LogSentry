@@ -27,8 +27,14 @@ NASA_HTTP_REGEX = re.compile(
     r"(?P<bytes>\d+|-)(?:\s+.*)?$"
 )
 
-# Synchronization lock for window operations & config cache access
+# Synchronization lock for config cache access & global state
 _window_lock = threading.Lock()
+
+# Independent per-source locks to prevent HDFS and NASA from blocking each other
+_source_window_locks = {
+    "hdfs": threading.Lock(),
+    "nasa_http": threading.Lock(),
+}
 
 # In-memory dynamic config cache (loaded from DB, editable by ADMIN at runtime)
 _config_cache = {
@@ -117,22 +123,35 @@ def _check_sliding_window(source_category, epoch_timestamp, raw_message):
     """
     Time-based sliding window anomaly detection using collections.deque.
     FR-06, NFR-04:
-    - Maintains independent window deques for HDFS and NASA-HTTP.
+    - Maintains independent window deques and independent locks for HDFS and NASA-HTTP.
     - Evicts timestamps older than window W: O(1) amortized eviction.
+    - Handles out-of-order timestamps via sorted insertion.
+    - Moves database writes OUTSIDE the critical section to prevent lock contention.
     - Fires alert if count reaches threshold T.
-    - Thread-safe serialization via _window_lock.
     """
     cat = "hdfs" if "hdfs" in source_category.lower() else "nasa_http"
-    window_sec = _config_cache.get(f"{cat}_window", 60)
-    threshold = _config_cache.get(f"{cat}_threshold", 5)
+    lock = _source_window_locks.get(cat, _window_lock)
 
     with _window_lock:
+        window_sec = _config_cache.get(f"{cat}_window", 60)
+        threshold = _config_cache.get(f"{cat}_threshold", 5)
+
+    should_fire = False
+    alert_payload = None
+
+    with lock:
         if cat not in _sliding_windows:
             _sliding_windows[cat] = deque()
 
         window_deque = _sliding_windows[cat]
         now_ts = epoch_timestamp if epoch_timestamp else time.time()
-        window_deque.append(now_ts)
+
+        # Handle in-order and out-of-order timestamps
+        if not window_deque or now_ts >= window_deque[-1]:
+            window_deque.append(now_ts)
+        else:
+            import bisect
+            bisect.insort(window_deque, now_ts)
 
         # Evict timestamps left of window: timestamp < now - W
         while window_deque and (now_ts - window_deque[0]) > window_sec:
@@ -140,16 +159,25 @@ def _check_sliding_window(source_category, epoch_timestamp, raw_message):
 
         # Trigger alert if threshold reached
         if len(window_deque) >= threshold:
-            alert_type = f"{cat.upper()}_ANOMALY_BURST"
-            db.save_alert(
-                source="HDFS" if cat == "hdfs" else "NASA-HTTP",
-                alert_type=alert_type,
-                event_count=len(window_deque),
-                window_duration_sec=window_sec,
-            )
+            should_fire = True
+            alert_payload = {
+                "source": "HDFS" if cat == "hdfs" else "NASA-HTTP",
+                "alert_type": f"{cat.upper()}_ANOMALY_BURST",
+                "event_count": len(window_deque),
+                "window_duration_sec": window_sec,
+            }
             window_deque.clear()
-            return True
-        return False
+
+    # Move DB write OUTSIDE the critical section (Fix for Check 3)
+    if should_fire and alert_payload:
+        db.save_alert(
+            source=alert_payload["source"],
+            alert_type=alert_payload["alert_type"],
+            event_count=alert_payload["event_count"],
+            window_duration_sec=alert_payload["window_duration_sec"],
+        )
+        return True
+    return False
 
 
 def parse_line(line, declared_source="hdfs"):
@@ -270,8 +298,10 @@ def parse_line(line, declared_source="hdfs"):
 def reset_sliding_windows():
     """Reset in-memory sliding window deques for test isolation."""
     with _window_lock:
-        for deque_obj in _sliding_windows.values():
-            deque_obj.clear()
+        for k, deque_obj in _sliding_windows.items():
+            lock = _source_window_locks.get(k, _window_lock)
+            with lock:
+                deque_obj.clear()
 
 
 def parse_to_model(line, declared_source="hdfs"):
