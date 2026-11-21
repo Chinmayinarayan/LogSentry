@@ -596,3 +596,84 @@ def test_concurrent_flush_calls_prevent_duplicate_persists():
     assert parser.get_pending_alerts_count("hdfs") == 0
     types = [a["alert_type"] for a in alerts_in_db]
     assert len(set(types)) == 8
+
+
+def test_new_alert_arrival_preserves_fifo_order_behind_unflushed_alerts(monkeypatch):
+    """
+    Verify:
+    1. Three older alerts A, B, C are pending.
+    2. Flush runs: A persists, B fails, C remains pending.
+    3. New alert D arrives via _persist_alert_with_retry().
+    4. D must NOT be persisted ahead of B and C; D must be retained in the pending buffer behind C.
+    5. When the database recovers and flushes, all alerts are persisted in exact FIFO order: A, B, C, D.
+    """
+    parser.reset_pending_alerts()
+
+    # Step 1: Buffer 3 older alerts A, B, C
+    parser._buffer_failed_alert("hdfs", {
+        "source": "HDFS",
+        "alert_type": "ALERT_A",
+        "event_count": 3,
+        "window_duration_sec": 60,
+    })
+    parser._buffer_failed_alert("hdfs", {
+        "source": "HDFS",
+        "alert_type": "ALERT_B",
+        "event_count": 4,
+        "window_duration_sec": 60,
+    })
+    parser._buffer_failed_alert("hdfs", {
+        "source": "HDFS",
+        "alert_type": "ALERT_C",
+        "event_count": 5,
+        "window_duration_sec": 60,
+    })
+    assert parser.get_pending_alerts_count("hdfs") == 3
+
+    # Step 2: Flush runs: A succeeds, B fails
+    original_save = db.save_alert
+
+    def save_mock(source, alert_type, event_count, window_duration_sec, **kwargs):
+        if alert_type == "ALERT_B":
+            import sqlite3
+            raise sqlite3.OperationalError("database is locked (ALERT_B failure)")
+        return original_save(source, alert_type, event_count, window_duration_sec, **kwargs)
+
+    monkeypatch.setattr(db, "save_alert", save_mock)
+
+    flushed = parser.flush_pending_alerts("hdfs")
+    assert flushed == 1
+    # B and C remain in buffer
+    assert parser.get_pending_alerts_count("hdfs") == 2
+
+    # Step 3: New alert D arrives via _persist_alert_with_retry()
+    # While B is still failing, D arrives
+    d_payload = {
+        "source": "HDFS",
+        "alert_type": "ALERT_D",
+        "event_count": 6,
+        "window_duration_sec": 60,
+    }
+    # D must NOT bypass B and C to write to DB!
+    parser._persist_alert_with_retry("hdfs", d_payload)
+
+    # D was buffered behind C because B and C were still pending
+    assert parser.get_pending_alerts_count("hdfs") == 3
+    # In SQLite DB, only ALERT_A is present
+    db_alerts = db.get_alerts()
+    assert len(db_alerts) == 1
+    assert db_alerts[0]["alert_type"] == "ALERT_A"
+
+    # Step 4: Database recovers fully
+    monkeypatch.setattr(db, "save_alert", original_save)
+
+    # Step 5: Flush remaining alerts
+    flushed_remaining = parser.flush_pending_alerts("hdfs")
+    assert flushed_remaining == 3
+    assert parser.get_pending_alerts_count("hdfs") == 0
+
+    # Verify all 4 alerts are in DB in strict FIFO order: A, then B, then C, then D
+    all_final = db.get_alerts()
+    assert len(all_final) == 4
+    in_order = sorted(all_final, key=lambda a: a["alert_id"])
+    assert [a["alert_type"] for a in in_order] == ["ALERT_A", "ALERT_B", "ALERT_C", "ALERT_D"]
