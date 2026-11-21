@@ -52,49 +52,107 @@ _sliding_windows = {
     "nasa_http": deque(),
 }
 
-# Bounded in-memory buffers for failed alerts awaiting database persistence
-# Thread-safe queue.Queue guarantees zero alert loss if SQLite is momentarily locked or busy.
+# Bounded in-memory fallback buffers for failed alerts awaiting database persistence.
+#
+# Persistence Guarantees & Constraints:
+# - Resilient against transient SQLite write contention ("database is locked") via bounded retries.
+# - Unpersisted alerts are held in a bounded FIFO queue (capacity 1,000 per source).
+# - Thread-safe synchronization is provided via per-source threading.Lock primitives (not lock-free).
+# - LIMITATION: In-memory buffers are volatile; an ungraceful process termination or system crash
+#   will result in loss of any uncommitted buffered alerts.
+# - LIMITATION: If the database is unreachable and the buffer reaches capacity (1,000 alerts),
+#   subsequent alerts are dropped, and the observable dropped_alerts counter is incremented.
+PENDING_ALERT_BUFFER_CAPACITY = 1000
+
 _pending_alert_buffers = {
-    "hdfs": queue.Queue(maxsize=1000),
-    "nasa_http": queue.Queue(maxsize=1000),
+    "hdfs": deque(),
+    "nasa_http": deque(),
+}
+_pending_alert_locks = {
+    "hdfs": threading.Lock(),
+    "nasa_http": threading.Lock(),
+}
+_flush_locks = {
+    "hdfs": threading.Lock(),
+    "nasa_http": threading.Lock(),
 }
 
+_dropped_alerts_count = {
+    "hdfs": 0,
+    "nasa_http": 0,
+}
+_dropped_lock = threading.Lock()
 
-def _flush_pending_alerts_for_source(cat: str) -> int:
-    """Attempt to drain and save any previously buffered failed alerts for this source category."""
-    q = _pending_alert_buffers.get(cat)
-    if not q or q.empty():
-        return 0
+
+def _buffer_failed_alert(cat: str, alert_payload: dict) -> bool:
+    """
+    Buffer an unpersisted alert payload into the bounded pending deque.
+    If capacity is reached, increments the dropped alerts counter and logs an explicit warning.
+    Returns True if buffered, False if dropped.
+    """
+    with _pending_alert_locks[cat]:
+        dq = _pending_alert_buffers[cat]
+        if len(dq) < PENDING_ALERT_BUFFER_CAPACITY:
+            dq.append(alert_payload)
+            return True
+
+    with _dropped_lock:
+        _dropped_alerts_count[cat] += 1
+        total_dropped = _dropped_alerts_count[cat]
+
+    print(
+        f"[_buffer_failed_alert] WARNING: Pending alert buffer capacity ({PENDING_ALERT_BUFFER_CAPACITY}) "
+        f"reached for '{cat}'. Alert dropped. Total dropped for source: {total_dropped}"
+    )
+    return False
+
+
+def _flush_pending_alerts_for_source(cat: str, max_batch: int = 50) -> int:
+    """
+    Attempt to persist previously buffered failed alerts for source category.
+    Thread-safety & Reliability:
+    - Uses non-blocking _flush_locks[cat] so concurrent flushes do not interleave or duplicate writes.
+    - Peeks at dq[0] under lock, attempts db.save_alert outside lock, and only pops dq[0] on success.
+    - If a write fails, dq[0] remains at the head of the deque (no re-queuing, no reordering, no drop risk).
+    """
+    if not _flush_locks[cat].acquire(blocking=False):
+        return 0  # Another thread is actively flushing this category
+
     flushed = 0
-    # Drain up to 50 alerts in one pass to avoid blocking callers
-    for _ in range(50):
-        if q.empty():
-            break
-        try:
-            payload = q.get_nowait()
-        except queue.Empty:
-            break
-        try:
-            db.save_alert(
-                source=payload["source"],
-                alert_type=payload["alert_type"],
-                event_count=payload["event_count"],
-                window_duration_sec=payload["window_duration_sec"],
-            )
-            flushed += 1
-        except Exception:
-            # Database is still locked/failing; put it back and abort drain
+    try:
+        for _ in range(max_batch):
+            with _pending_alert_locks[cat]:
+                dq = _pending_alert_buffers[cat]
+                if not dq:
+                    break
+                payload = dq[0]  # Peek without popping
+
             try:
-                q.put_nowait(payload)
-            except queue.Full:
-                pass
-            break
+                db.save_alert(
+                    source=payload["source"],
+                    alert_type=payload["alert_type"],
+                    event_count=payload["event_count"],
+                    window_duration_sec=payload["window_duration_sec"],
+                )
+            except Exception:
+                # DB write failed: alert remains at dq[0], stop flush attempt
+                break
+
+            with _pending_alert_locks[cat]:
+                dq = _pending_alert_buffers[cat]
+                if dq and dq[0] is payload:
+                    dq.popleft()
+                    flushed += 1
+    finally:
+        _flush_locks[cat].release()
+
     return flushed
 
 
 def flush_pending_alerts(source_category: Optional[str] = None) -> int:
     """
-    Public API to flush buffered failed alerts to E3 Vault.
+    Public API to flush buffered alerts to E3 Vault.
+    Triggered on-demand, during test cleanup, or via administrative/monitoring actions.
     If source_category is None, flushes both HDFS and NASA-HTTP.
     """
     total = 0
@@ -111,30 +169,74 @@ def get_pending_alerts_count(source_category: Optional[str] = None) -> int:
     """Return count of buffered alerts currently waiting for persistence."""
     if source_category:
         cat = "hdfs" if "hdfs" in source_category.lower() else "nasa_http"
-        q = _pending_alert_buffers.get(cat)
-        return q.qsize() if q else 0
-    return sum(q.qsize() for q in _pending_alert_buffers.values())
+        with _pending_alert_locks[cat]:
+            return len(_pending_alert_buffers[cat])
+    total = 0
+    for cat in ("hdfs", "nasa_http"):
+        with _pending_alert_locks[cat]:
+            total += len(_pending_alert_buffers[cat])
+    return total
+
+
+def get_dropped_alerts_count(source_category: Optional[str] = None) -> int:
+    """Return count of alerts dropped due to pending buffer overflow."""
+    with _dropped_lock:
+        if source_category:
+            cat = "hdfs" if "hdfs" in source_category.lower() else "nasa_http"
+            return _dropped_alerts_count.get(cat, 0)
+        return sum(_dropped_alerts_count.values())
+
+
+def get_alert_buffer_metrics() -> dict:
+    """
+    Return comprehensive operational metrics for pending and dropped alerts.
+    Exposed for monitoring, dashboard health checks, and test assertions.
+    """
+    with _dropped_lock:
+        dropped_copy = dict(_dropped_alerts_count)
+
+    metrics = {}
+    for cat in ("hdfs", "nasa_http"):
+        with _pending_alert_locks[cat]:
+            pending_count = len(_pending_alert_buffers[cat])
+        metrics[cat] = {
+            "pending_count": pending_count,
+            "buffer_capacity": PENDING_ALERT_BUFFER_CAPACITY,
+            "buffer_utilization_pct": round((pending_count / PENDING_ALERT_BUFFER_CAPACITY) * 100, 2),
+            "dropped_count": dropped_copy.get(cat, 0),
+            "has_pending_alerts": pending_count > 0,
+            "has_dropped_alerts": dropped_copy.get(cat, 0) > 0,
+        }
+    return metrics
 
 
 def reset_pending_alerts():
-    """Clear buffered failed alerts for test isolation."""
-    for q in _pending_alert_buffers.values():
-        while not q.empty():
-            try:
-                q.get_nowait()
-            except queue.Empty:
-                break
+    """Clear buffered failed alerts and reset dropped counters for test isolation."""
+    for cat in ("hdfs", "nasa_http"):
+        with _pending_alert_locks[cat]:
+            _pending_alert_buffers[cat].clear()
+    with _dropped_lock:
+        _dropped_alerts_count["hdfs"] = 0
+        _dropped_alerts_count["nasa_http"] = 0
 
 
 def _persist_alert_with_retry(cat: str, alert_payload: dict, max_retries: int = 3, backoff_base: float = 0.02) -> bool:
     """
     Persist an alert payload with bounded retries and exponential backoff outside the lock.
-    If all retries fail, buffers the alert into _pending_alert_buffers[cat] to guarantee zero alert loss.
+    If prior alerts remain unpersisted, buffers the alert to maintain FIFO order.
+    If retries fail, buffers the alert into the bounded pending buffer.
     """
-    # 1. First attempt to flush any prior pending alerts for this category
+    # 1. Attempt to flush any prior pending alerts for this category
     _flush_pending_alerts_for_source(cat)
 
-    # 2. Attempt immediate persist with bounded retry
+    # 2. If the buffer still contains pending alerts, preserve strict FIFO order
+    with _pending_alert_locks[cat]:
+        has_pending = len(_pending_alert_buffers[cat]) > 0
+
+    if has_pending:
+        return _buffer_failed_alert(cat, alert_payload)
+
+    # 3. Buffer is clean: attempt immediate persist with bounded retry
     for attempt in range(max_retries):
         try:
             db.save_alert(
@@ -149,15 +251,9 @@ def _persist_alert_with_retry(cat: str, alert_payload: dict, max_retries: int = 
                 # Exponential backoff (e.g. 0.02s, 0.04s)
                 time.sleep(backoff_base * (2 ** attempt))
             else:
-                # Retries exhausted: buffer into pending queue to prevent alert loss
+                # Retries exhausted: buffer into pending deque
                 print(f"[_persist_alert_with_retry] Warning: Failed to persist alert after {max_retries} attempts: {exc}. Buffering.")
-                q = _pending_alert_buffers.get(cat)
-                if q:
-                    try:
-                        q.put_nowait(alert_payload)
-                    except queue.Full:
-                        print(f"[_persist_alert_with_retry] Error: Pending alert buffer full for {cat}")
-                return False
+                return _buffer_failed_alert(cat, alert_payload)
     return False
 
 

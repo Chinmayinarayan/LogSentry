@@ -446,3 +446,153 @@ def test_hdfs_alert_persistence_failure_does_not_block_nasa(monkeypatch):
     sources = {a["source"] for a in all_alerts}
     assert "HDFS" in sources
     assert "NASA-HTTP" in sources
+
+
+# =====================================================================
+# 9. PENDING BUFFER OVERFLOW & FLUSH RELIABILITY AUDIT TESTS
+# =====================================================================
+
+def test_pending_buffer_reaches_capacity_and_increments_dropped_counter(monkeypatch):
+    """
+    Verify:
+    1. Pending buffer accepts alerts up to capacity (simulated with capacity 5).
+    2. Attempting to enqueue when buffer is full fails safely.
+    3. Alert is dropped and observable dropped_alerts counter is incremented.
+    4. Queue does NOT grow unbounded.
+    """
+    monkeypatch.setattr(parser, "PENDING_ALERT_BUFFER_CAPACITY", 5)
+    parser.reset_pending_alerts()
+
+    # Fill up to capacity 5
+    for i in range(5):
+        payload = {
+            "source": "HDFS",
+            "alert_type": "HDFS_ANOMALY_BURST",
+            "event_count": i + 1,
+            "window_duration_sec": 60,
+        }
+        res = parser._buffer_failed_alert("hdfs", payload)
+        assert res is True
+
+    assert parser.get_pending_alerts_count("hdfs") == 5
+    assert parser.get_dropped_alerts_count("hdfs") == 0
+
+    # Attempt to buffer the 6th alert (overflow condition)
+    overflow_payload = {
+        "source": "HDFS",
+        "alert_type": "HDFS_ANOMALY_BURST",
+        "event_count": 6,
+        "window_duration_sec": 60,
+    }
+    res_overflow = parser._buffer_failed_alert("hdfs", overflow_payload)
+    assert res_overflow is False
+
+    # Verify bounded capacity maintained and dropped counter incremented
+    assert parser.get_pending_alerts_count("hdfs") == 5
+    assert parser.get_dropped_alerts_count("hdfs") == 1
+
+    # Verify diagnostic metrics reflect overflow state
+    metrics = parser.get_alert_buffer_metrics()
+    assert metrics["hdfs"]["pending_count"] == 5
+    assert metrics["hdfs"]["dropped_count"] == 1
+    assert metrics["hdfs"]["has_dropped_alerts"] is True
+    assert metrics["hdfs"]["buffer_utilization_pct"] == 100.0
+
+
+def test_failed_flush_retains_alerts_in_fifo_order_without_loss(monkeypatch):
+    """
+    Verify:
+    1. If a flush fails halfway through, the unpersisted alerts remain at the head of the buffer.
+    2. No alerts are dropped or reordered during a failed flush.
+    3. A subsequent flush correctly resumes from the unwritten alert.
+    """
+    parser.reset_pending_alerts()
+
+    # Buffer 3 alerts
+    for i in range(1, 4):
+        parser._buffer_failed_alert("hdfs", {
+            "source": "HDFS",
+            "alert_type": f"ALERT_{i}",
+            "event_count": i,
+            "window_duration_sec": 60,
+        })
+
+    assert parser.get_pending_alerts_count("hdfs") == 3
+
+    # Simulate DB failure on the 2nd write (ALERT_2)
+    original_save = db.save_alert
+    call_idx = 0
+
+    def fail_on_second_call(*args, **kwargs):
+        nonlocal call_idx
+        call_idx += 1
+        if call_idx == 2:
+            import sqlite3
+            raise sqlite3.OperationalError("database is locked (transient during flush)")
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(db, "save_alert", fail_on_second_call)
+
+    # 1st flush attempt: saves ALERT_1, fails on ALERT_2
+    flushed = parser.flush_pending_alerts("hdfs")
+    assert flushed == 1
+    # ALERT_2 and ALERT_3 must remain in buffer
+    assert parser.get_pending_alerts_count("hdfs") == 2
+
+    # Check database: only ALERT_1 was written
+    alerts_in_db = db.get_alerts()
+    assert len(alerts_in_db) == 1
+    assert alerts_in_db[0]["alert_type"] == "ALERT_1"
+
+    # Restore DB and retry flush
+    monkeypatch.setattr(db, "save_alert", original_save)
+    flushed_remaining = parser.flush_pending_alerts("hdfs")
+    assert flushed_remaining == 2
+    assert parser.get_pending_alerts_count("hdfs") == 0
+
+    # Verify all 3 alerts are in DB in strict FIFO order (ordered by insertion alert_id)
+    final_alerts = db.get_alerts()
+    assert len(final_alerts) == 3
+    in_order = sorted(final_alerts, key=lambda a: a["alert_id"])
+    assert [a["alert_type"] for a in in_order] == ["ALERT_1", "ALERT_2", "ALERT_3"]
+
+
+def test_concurrent_flush_calls_prevent_duplicate_persists():
+    """
+    Verify that concurrent flush_pending_alerts calls across multiple threads
+    never duplicate writes or drop pending alerts.
+    """
+    parser.reset_pending_alerts()
+
+    # Pre-fill buffer with 8 alerts
+    for i in range(8):
+        parser._buffer_failed_alert("hdfs", {
+            "source": "HDFS",
+            "alert_type": f"CONCURRENT_ALERT_{i}",
+            "event_count": i + 1,
+            "window_duration_sec": 60,
+        })
+
+    assert parser.get_pending_alerts_count("hdfs") == 8
+
+    # Spawn 4 threads all attempting to flush HDFS pending alerts concurrently
+    errors = []
+    def flush_worker():
+        try:
+            parser.flush_pending_alerts("hdfs")
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=flush_worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert len(errors) == 0
+    # All 8 alerts must be written, with 0 duplicates
+    alerts_in_db = db.get_alerts()
+    assert len(alerts_in_db) == 8
+    assert parser.get_pending_alerts_count("hdfs") == 0
+    types = [a["alert_type"] for a in alerts_in_db]
+    assert len(set(types)) == 8
