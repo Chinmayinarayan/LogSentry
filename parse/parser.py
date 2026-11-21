@@ -1,10 +1,12 @@
 """DSA Engine — Pre-compiled regex parsing, strict format validation, and time-based sliding-window anomaly detection."""
 
 import re
+import threading
 import time
 from collections import deque
 from datetime import datetime
 from vault import db
+from src.common.models import LogEvent
 
 # Pre-compiled Regex Patterns (compiled once at init)
 # Supports standard Loghub HDFS (081109 203518 143 WARN dfs.FSNamesystem: ...)
@@ -25,6 +27,9 @@ NASA_HTTP_REGEX = re.compile(
     r"(?P<bytes>\d+|-)(?:\s+.*)?$"
 )
 
+# Synchronization lock for window operations & config cache access
+_window_lock = threading.Lock()
+
 # In-memory dynamic config cache (loaded from DB, editable by ADMIN at runtime)
 _config_cache = {
     "hdfs_window": 60,
@@ -44,24 +49,42 @@ def refresh_config_cache():
     """Reload sliding window settings W and T from E3 Vault."""
     try:
         cfg = db.get_all_configs()
-        if "hdfs_window" in cfg:
-            _config_cache["hdfs_window"] = int(cfg["hdfs_window"])
-        if "hdfs_threshold" in cfg:
-            _config_cache["hdfs_threshold"] = int(cfg["hdfs_threshold"])
-        if "nasa_http_window" in cfg:
-            _config_cache["nasa_http_window"] = int(cfg["nasa_http_window"])
-        if "nasa_http_threshold" in cfg:
-            _config_cache["nasa_http_threshold"] = int(cfg["nasa_http_threshold"])
+        with _window_lock:
+            if "hdfs_window" in cfg:
+                _config_cache["hdfs_window"] = int(cfg["hdfs_window"])
+            if "hdfs_threshold" in cfg:
+                _config_cache["hdfs_threshold"] = int(cfg["hdfs_threshold"])
+            if "nasa_http_window" in cfg:
+                _config_cache["nasa_http_window"] = int(cfg["nasa_http_window"])
+            if "nasa_http_threshold" in cfg:
+                _config_cache["nasa_http_threshold"] = int(cfg["nasa_http_threshold"])
     except Exception as exc:
         print(f"[refresh_config_cache] warning: {exc}")
 
 
 def get_config_cache():
-    return dict(_config_cache)
+    with _window_lock:
+        return dict(_config_cache)
 
 
 def set_config_value(key, value):
-    _config_cache[key] = int(value)
+    with _window_lock:
+        _config_cache[key] = int(value)
+
+
+def get_sliding_window_stats():
+    """Return current window occupancy and configuration for monitoring."""
+    with _window_lock:
+        return {
+            k: {
+                "current_count": len(dq),
+                "window_seconds": _config_cache.get(f"{k}_window", 60),
+                "threshold": _config_cache.get(f"{k}_threshold", 5),
+                "oldest_ts": dq[0] if dq else None,
+                "newest_ts": dq[-1] if dq else None,
+            }
+            for k, dq in _sliding_windows.items()
+        }
 
 
 def parse_hdfs_timestamp(gd):
@@ -93,35 +116,40 @@ def parse_nasa_timestamp(time_str):
 def _check_sliding_window(source_category, epoch_timestamp, raw_message):
     """
     Time-based sliding window anomaly detection using collections.deque.
-    Evicts timestamps older than window W, fires alert if count reaches threshold T.
+    FR-06, NFR-04:
+    - Maintains independent window deques for HDFS and NASA-HTTP.
+    - Evicts timestamps older than window W: O(1) amortized eviction.
+    - Fires alert if count reaches threshold T.
+    - Thread-safe serialization via _window_lock.
     """
     cat = "hdfs" if "hdfs" in source_category.lower() else "nasa_http"
     window_sec = _config_cache.get(f"{cat}_window", 60)
     threshold = _config_cache.get(f"{cat}_threshold", 5)
 
-    if cat not in _sliding_windows:
-        _sliding_windows[cat] = deque()
+    with _window_lock:
+        if cat not in _sliding_windows:
+            _sliding_windows[cat] = deque()
 
-    window_deque = _sliding_windows[cat]
-    now_ts = epoch_timestamp if epoch_timestamp else time.time()
-    window_deque.append(now_ts)
+        window_deque = _sliding_windows[cat]
+        now_ts = epoch_timestamp if epoch_timestamp else time.time()
+        window_deque.append(now_ts)
 
-    # Evict timestamps left of window: timestamp < now - W
-    while window_deque and (now_ts - window_deque[0]) > window_sec:
-        window_deque.popleft()
+        # Evict timestamps left of window: timestamp < now - W
+        while window_deque and (now_ts - window_deque[0]) > window_sec:
+            window_deque.popleft()
 
-    # Trigger alert if threshold reached
-    if len(window_deque) >= threshold:
-        alert_type = f"{cat.upper()}_ANOMALY_BURST"
-        db.save_alert(
-            source=cat.upper(),
-            alert_type=alert_type,
-            event_count=len(window_deque),
-            window_duration_sec=window_sec,
-        )
-        window_deque.clear()
-        return True
-    return False
+        # Trigger alert if threshold reached
+        if len(window_deque) >= threshold:
+            alert_type = f"{cat.upper()}_ANOMALY_BURST"
+            db.save_alert(
+                source="HDFS" if cat == "hdfs" else "NASA-HTTP",
+                alert_type=alert_type,
+                event_count=len(window_deque),
+                window_duration_sec=window_sec,
+            )
+            window_deque.clear()
+            return True
+        return False
 
 
 def parse_line(line, declared_source="hdfs"):
@@ -241,5 +269,17 @@ def parse_line(line, declared_source="hdfs"):
 
 def reset_sliding_windows():
     """Reset in-memory sliding window deques for test isolation."""
-    for deque_obj in _sliding_windows.values():
-        deque_obj.clear()
+    with _window_lock:
+        for deque_obj in _sliding_windows.values():
+            deque_obj.clear()
+
+
+def parse_to_model(line, declared_source="hdfs"):
+    """
+    Parse an ingested line and return a typed LogEvent dataclass on success.
+    Returns None if line was malformed, binary, or wrong-source (quarantined).
+    """
+    res = parse_line(line, declared_source=declared_source)
+    if res:
+        return LogEvent.from_dict(res)
+    return None

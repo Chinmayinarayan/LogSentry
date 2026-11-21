@@ -97,9 +97,14 @@ def worker_thread(source_name: str, file_path: str, stop_event: threading.Event)
                 if line:
                     clean_line = line.rstrip("\r\n")
                     if clean_line:
-                        # Blocking put implements NFR-01 backpressure guarantee
-                        log_queue.put((source_name, clean_line))
-                        _increment_processed(1)
+                        # Non-blocking backpressure: blocks up to 0.2s then checks stop_event
+                        while not stop_event.is_set():
+                            try:
+                                log_queue.put((source_name, clean_line), timeout=0.2)
+                                _increment_processed(1)
+                                break
+                            except queue.Full:
+                                continue
                 else:
                     time.sleep(0.1)
     except Exception as exc:
@@ -198,6 +203,14 @@ def _ingest_zip_container(source_name: str, stream: Any, filename: str = "") -> 
         stream.seek(0)
         with zipfile.ZipFile(stream) as zf:
             members = [m for m in zf.namelist() if not m.endswith("/")]
+            # Resource exhaustion protections (zip bomb mitigation)
+            if len(members) > 100:
+                return {"status": "error", "message": f"Security restriction: ZIP archive contains {len(members)} files (max limit 100)"}
+
+            total_uncompressed = sum(zf.getinfo(m).file_size for m in members)
+            if total_uncompressed > 100 * 1024 * 1024:
+                return {"status": "error", "message": f"Security restriction: ZIP uncompressed size {total_uncompressed / (1024*1024):.1f}MB exceeds limit of 100MB"}
+
             log_members = [m for m in members if m.lower().endswith((".log", ".txt", ".csv"))]
             if not log_members and members:
                 log_members = [members[0]]  # Fallback to first non-directory member
