@@ -11,82 +11,92 @@ _lock = threading.Lock()
 
 
 def get_db_connection():
-    """Open a SQLite connection with Row factory enabled."""
+    """Open a SQLite connection with Row factory enabled, timeout and foreign keys enabled."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
 
 def init_db():
     """Create all 6 required tables and indexes, and populate default seed data."""
     conn = get_db_connection()
+    schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
     with conn:
-        conn.executescript(
-            """
-            PRAGMA foreign_keys = ON;
+        if os.path.exists(schema_path):
+            with open(schema_path, "r", encoding="utf-8") as f:
+                conn.executescript(f.read())
+        else:
+            conn.executescript(
+                """
+                PRAGMA journal_mode = WAL;
+                PRAGMA foreign_keys = ON;
+                PRAGMA busy_timeout = 30000;
 
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                role TEXT CHECK(role IN ('ADMIN','OPERATOR','VIEWER')) NOT NULL,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    role TEXT CHECK(role IN ('ADMIN','OPERATOR','VIEWER')) NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
 
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME NOT NULL,
-                source TEXT NOT NULL,
-                log_level TEXT NOT NULL,
-                component_host TEXT,
-                raw_message TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME NOT NULL,
+                    source TEXT NOT NULL,
+                    log_level TEXT NOT NULL,
+                    component_host TEXT,
+                    raw_message TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS alerts (
-                alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME NOT NULL,
-                source TEXT NOT NULL,
-                alert_type TEXT NOT NULL,
-                event_count INT NOT NULL,
-                window_duration_sec INT NOT NULL,
-                status TEXT DEFAULT 'ACTIVE',
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_by INTEGER REFERENCES users(user_id)
-            );
+                CREATE TABLE IF NOT EXISTS alerts (
+                    alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME NOT NULL,
+                    source TEXT NOT NULL,
+                    alert_type TEXT NOT NULL,
+                    event_count INT NOT NULL,
+                    window_duration_sec INT NOT NULL,
+                    status TEXT DEFAULT 'ACTIVE',
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_by INTEGER REFERENCES users(user_id)
+                );
 
-            CREATE TABLE IF NOT EXISTS config (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_by INTEGER REFERENCES users(user_id)
-            );
+                CREATE TABLE IF NOT EXISTS config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_by INTEGER REFERENCES users(user_id)
+                );
 
-            CREATE TABLE IF NOT EXISTS history (
-                history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                table_name TEXT NOT NULL,
-                record_id INTEGER NOT NULL,
-                field_changed TEXT NOT NULL,
-                old_value TEXT,
-                new_value TEXT,
-                changed_by INTEGER REFERENCES users(user_id),
-                changed_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
+                CREATE TABLE IF NOT EXISTS history (
+                    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    table_name TEXT NOT NULL,
+                    record_id INTEGER NOT NULL,
+                    field_changed TEXT NOT NULL,
+                    old_value TEXT,
+                    new_value TEXT,
+                    changed_by INTEGER REFERENCES users(user_id),
+                    changed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
 
-            CREATE TABLE IF NOT EXISTS rejected_lines (
-                rejected_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME NOT NULL,
-                source TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                raw_bytes BLOB NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS rejected_lines (
+                    rejected_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME NOT NULL,
+                    source TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    raw_bytes BLOB NOT NULL
+                );
 
-            CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_events_level ON events(log_level);
-            CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_history_record ON history(table_name, record_id);
-            CREATE INDEX IF NOT EXISTS idx_rejected_source ON rejected_lines(source);
-            """
-        )
+                CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_events_level ON events(log_level);
+                CREATE INDEX IF NOT EXISTS idx_events_source ON events(source);
+                CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+                CREATE INDEX IF NOT EXISTS idx_history_record ON history(table_name, record_id);
+                CREATE INDEX IF NOT EXISTS idx_rejected_source ON rejected_lines(source);
+                """
+            )
 
         # Seed default users if empty
         cur = conn.execute("SELECT COUNT(*) AS c FROM users")
