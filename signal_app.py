@@ -19,6 +19,8 @@ app = Flask(
     static_folder="signal/static",
 )
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB file upload limit
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.secret_key = os.urandom(24)
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -145,10 +147,20 @@ def api_events():
     start_time = request.args.get("start_time", None, type=str)
     end_time = request.args.get("end_time", None, type=str)
 
+    if page < 1:
+        page = 1
+    if limit < 1 or limit > 500:
+        limit = 50
+
     if level and level.upper() in ("ALL", "*", ""):
         level = None
+    elif level:
+        level = level.strip().upper()
+
     if source and source.upper() in ("ALL", "*", ""):
         source = None
+    elif source:
+        source = source.strip().lower().replace("-", "_")
 
     offset = (page - 1) * limit
     res = db.get_events(
@@ -169,8 +181,10 @@ def api_alerts():
     status = request.args.get("status", None, type=str)
     if status and status.upper() in ("ALL", "*", ""):
         status = None
+    elif status:
+        status = status.strip().upper()
     alerts = db.get_alerts(limit=limit, status=status)
-    return jsonify({"alerts": alerts})
+    return jsonify({"alerts": alerts, "count": len(alerts)})
 
 
 @app.route("/api/alerts/<int:alert_id>/resolve", methods=["POST"])
@@ -261,18 +275,25 @@ def api_get_config():
 def api_update_config():
     user = get_current_user()
     data = request.get_json(silent=True) or request.form
-    updated_keys = []
+    if not data:
+        return jsonify({"error": "No configuration parameters provided"}), 400
 
+    updated_keys = []
     valid_keys = {"hdfs_window", "hdfs_threshold", "nasa_http_window", "nasa_http_threshold"}
     for key, val in data.items():
         if key in valid_keys:
             try:
                 val_int = int(val)
+                if val_int <= 0:
+                    return jsonify({"error": f"Value for key '{key}' must be a positive integer"}), 400
                 db.update_config(key, str(val_int), user_id=user["user_id"])
                 parser.set_config_value(key, val_int)
                 updated_keys.append(key)
-            except ValueError:
+            except (ValueError, TypeError):
                 return jsonify({"error": f"Invalid integer value for key '{key}'"}), 400
+
+    if not updated_keys:
+        return jsonify({"error": "No valid configuration keys provided"}), 400
 
     parser.refresh_config_cache()
     return jsonify({
@@ -322,15 +343,27 @@ def api_create_user():
 def api_stats():
     db_stats = db.get_event_stats()
     runtime = tailer.get_metrics()
+    alert_buffer = parser.get_alert_buffer_metrics()
     return jsonify({
         "total_events": db_stats["total_events"],
+        "hdfs_events": db_stats.get("hdfs_events", 0),
+        "nasa_events": db_stats.get("nasa_events", 0),
         "errors": db_stats["errors"],
+        "warn_count": db_stats.get("warn_count", 0),
+        "error_count": db_stats.get("error_count", 0),
         "active_alerts": db_stats["active_alerts"],
+        "resolved_alerts": db_stats.get("resolved_alerts", 0),
         "rejected_lines": db_stats["rejected_lines"],
         "active_threads": runtime["active_threads"],
         "queue_size": runtime["queue_size"],
         "events_processed": runtime["events_processed"],
+        "alert_buffer_metrics": alert_buffer,
     })
+
+
+@app.route("/api/metrics/pending-alerts", methods=["GET"])
+def api_pending_alerts():
+    return jsonify(parser.get_alert_buffer_metrics())
 
 
 @app.route("/api/metrics/timeseries", methods=["GET"])
@@ -339,6 +372,7 @@ def api_metrics_timeseries():
 
 
 @app.route("/api/reset", methods=["POST"])
+@require_role("ADMIN")
 def api_reset():
     db.reset_db()
     parser.reset_sliding_windows()

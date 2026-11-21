@@ -521,7 +521,7 @@ def get_events(limit=100, offset=0, source=None, level=None, start_time=None, en
         params = []
 
         if source:
-            clauses.append("source = ?")
+            clauses.append("LOWER(source) = LOWER(?)")
             params.append(source)
         if level:
             clauses.append("log_level = ?")
@@ -559,17 +559,29 @@ def get_event_stats():
     conn = get_db_connection()
     try:
         total_events = conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"]
+        hdfs_events = conn.execute("SELECT COUNT(*) AS c FROM events WHERE LOWER(source) = 'hdfs'").fetchone()["c"]
+        nasa_events = conn.execute("SELECT COUNT(*) AS c FROM events WHERE LOWER(source) IN ('nasa_http', 'nasa-http')").fetchone()["c"]
+        warn_count = conn.execute("SELECT COUNT(*) AS c FROM events WHERE log_level IN ('WARN', 'WARNING')").fetchone()["c"]
+        error_count = conn.execute("SELECT COUNT(*) AS c FROM events WHERE log_level IN ('ERROR', 'FATAL')").fetchone()["c"]
         errors = conn.execute(
             "SELECT COUNT(*) AS c FROM events WHERE log_level IN ('WARN', 'WARNING', 'ERROR', 'FATAL')"
         ).fetchone()["c"]
         active_alerts = conn.execute(
             "SELECT COUNT(*) AS c FROM alerts WHERE status = 'ACTIVE'"
         ).fetchone()["c"]
+        resolved_alerts = conn.execute(
+            "SELECT COUNT(*) AS c FROM alerts WHERE status = 'RESOLVED'"
+        ).fetchone()["c"]
         rejected_count = conn.execute("SELECT COUNT(*) AS c FROM rejected_lines").fetchone()["c"]
         return {
             "total_events": total_events,
+            "hdfs_events": hdfs_events,
+            "nasa_events": nasa_events,
             "errors": errors,
+            "warn_count": warn_count,
+            "error_count": error_count,
             "active_alerts": active_alerts,
+            "resolved_alerts": resolved_alerts,
             "rejected_lines": rejected_count,
         }
     finally:

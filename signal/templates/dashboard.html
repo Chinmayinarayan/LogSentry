@@ -53,7 +53,9 @@
           <i class="fa-solid fa-database text-indigo-400 text-base"></i>
         </div>
         <div id="statTotalEvents" class="text-2xl font-bold text-white mt-2">0</div>
-        <div class="text-xs text-slate-400 mt-1">HDFS & NASA-HTTP parsed</div>
+        <div class="text-xs text-slate-400 mt-1">
+          HDFS: <span id="statHdfs" class="text-indigo-300 font-semibold">0</span> | NASA: <span id="statNasa" class="text-indigo-300 font-semibold">0</span>
+        </div>
       </div>
 
       <div class="glass-card rounded-xl p-5 border-l-4 border-amber-500 shadow">
@@ -62,16 +64,22 @@
           <i class="fa-solid fa-triangle-exclamation text-amber-400 text-base"></i>
         </div>
         <div id="statErrors" class="text-2xl font-bold text-amber-400 mt-2">0</div>
-        <div class="text-xs text-slate-400 mt-1">WARN / ERROR log lines</div>
+        <div class="text-xs text-slate-400 mt-1">
+          WARN: <span id="statWarn" class="text-amber-300 font-semibold">0</span> | ERROR: <span id="statErr" class="text-rose-400 font-semibold">0</span>
+        </div>
       </div>
 
       <div class="glass-card rounded-xl p-5 border-l-4 border-rose-500 shadow">
         <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
-          <span>Active Alerts</span>
+          <span>Burst Alerts</span>
           <i class="fa-solid fa-bell text-rose-400 text-base"></i>
         </div>
-        <div id="statActiveAlerts" class="text-2xl font-bold text-rose-400 mt-2">0</div>
-        <div class="text-xs text-slate-400 mt-1">Sliding-window bursts</div>
+        <div class="text-2xl font-bold text-rose-400 mt-2">
+          <span id="statActiveAlerts">0</span> <span class="text-xs font-normal text-slate-400">active</span>
+        </div>
+        <div class="text-xs text-slate-400 mt-1">
+          Resolved: <span id="statResolvedAlerts" class="text-emerald-400 font-semibold">0</span>
+        </div>
       </div>
 
       <div class="glass-card rounded-xl p-5 border-l-4 border-purple-500 shadow">
@@ -81,21 +89,63 @@
         </div>
         <div id="statRejected" class="text-2xl font-bold text-purple-300 mt-2">0</div>
         <div class="text-xs text-slate-400 mt-1 cursor-pointer hover:underline text-purple-400" onclick="fetchRejectedLines()">
-          View rejected input log &rarr;
+          View quarantine locker &rarr;
         </div>
       </div>
 
       <div class="glass-card rounded-xl p-5 border-l-4 border-emerald-500 shadow">
         <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
-          <span>Engine Status</span>
+          <span>Engine & Ingestion Queue</span>
           <i class="fa-solid fa-network-wired text-emerald-400 text-base"></i>
         </div>
         <div class="text-lg font-bold text-emerald-400 mt-2 flex items-center space-x-2">
           <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
-          <span>HEALTHY</span>
+          <span>ONLINE</span>
         </div>
         <div class="text-xs text-slate-400 mt-1">
           Threads: <span id="statThreads" class="text-white font-medium">0</span> | Queue: <span id="statQueue" class="text-white font-medium">0</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- PENDING ALERT PERSISTENCE BUFFER METRICS (E2 RELIABILITY MONITOR) -->
+    <div class="glass-card rounded-xl p-5 shadow border border-slate-700">
+      <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-2 border-b border-slate-700/60 pb-3">
+        <div class="flex items-center space-x-2">
+          <i class="fa-solid fa-shield-virus text-indigo-400"></i>
+          <span class="text-sm font-bold text-white">E2 Pending Alert Persistence Buffers (FIFO Serialization Monitoring)</span>
+        </div>
+        <div class="flex items-center space-x-2">
+          <span id="bufStatusBadge" class="text-xs px-2.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+            Buffers Synchronized
+          </span>
+          <span class="text-[11px] text-slate-400">Live Polling (every 3s)</span>
+        </div>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 text-xs">
+        <div class="bg-slate-800/60 rounded-lg p-3 border border-slate-700/50 space-y-1">
+          <div class="flex justify-between font-bold text-slate-300">
+            <span>HDFS Alert Buffer</span>
+            <span id="bufHdfsUtil" class="text-indigo-400">0% utilized</span>
+          </div>
+          <div class="text-slate-400">
+            Pending in memory: <span id="bufHdfsPending" class="text-white font-semibold">0</span> / 1,000 capacity
+          </div>
+          <div class="text-slate-400">
+            Dropped count (buffer overflow): <span id="bufHdfsDropped" class="text-rose-400 font-semibold">0</span>
+          </div>
+        </div>
+        <div class="bg-slate-800/60 rounded-lg p-3 border border-slate-700/50 space-y-1">
+          <div class="flex justify-between font-bold text-slate-300">
+            <span>NASA-HTTP Alert Buffer</span>
+            <span id="bufNasaUtil" class="text-indigo-400">0% utilized</span>
+          </div>
+          <div class="text-slate-400">
+            Pending in memory: <span id="bufNasaPending" class="text-white font-semibold">0</span> / 1,000 capacity
+          </div>
+          <div class="text-slate-400">
+            Dropped count (buffer overflow): <span id="bufNasaDropped" class="text-rose-400 font-semibold">0</span>
+          </div>
         </div>
       </div>
     </div>
@@ -113,23 +163,30 @@
               <i class="fa-solid fa-chart-line text-indigo-400"></i>
               <span>Live Ingestion & Error Rate Timeline</span>
             </h2>
-            <span class="text-xs text-slate-400">Auto-refreshing every 3s</span>
+            <span class="text-xs text-slate-400">Live Polling (3s refresh)</span>
           </div>
           <div class="h-64">
             <canvas id="timelineChart"></canvas>
           </div>
         </div>
 
-        <!-- ACTIVE ANOMALY ALERTS -->
+        <!-- ANOMALY ALERTS TABLE -->
         <div class="glass-card rounded-xl p-6 shadow">
-          <div class="flex items-center justify-between mb-4">
+          <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-4">
             <h2 class="text-lg font-bold text-white flex items-center space-x-2">
               <i class="fa-solid fa-circle-exclamation text-rose-400"></i>
               <span>Sliding-Window Anomaly Alerts</span>
             </h2>
-            <button onclick="fetchAlerts()" class="text-xs text-indigo-400 hover:text-indigo-300">
-              <i class="fa-solid fa-rotate-right mr-1"></i> Refresh
-            </button>
+            <div class="flex items-center space-x-2">
+              <select id="alertStatusFilter" onchange="fetchAlerts()" class="bg-slate-800 border border-slate-700 rounded px-2.5 py-1 text-xs text-white">
+                <option value="ALL">All Statuses</option>
+                <option value="ACTIVE" selected>Active Only</option>
+                <option value="RESOLVED">Resolved Only</option>
+              </select>
+              <button onclick="fetchAlerts()" class="text-xs px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-indigo-400 border border-slate-700">
+                <i class="fa-solid fa-rotate-right mr-1"></i> Refresh
+              </button>
+            </div>
           </div>
           <div class="overflow-x-auto">
             <table class="w-full text-left text-sm text-slate-300">
@@ -466,19 +523,28 @@
       try {
         const res = await fetch('/api/me');
         const data = await res.json();
+        const configBtn = document.querySelector('#configForm button[type="submit"]');
         if (data.authenticated) {
           currentUser = data.user;
           document.getElementById('usernameBadge').textContent = currentUser.username;
           document.getElementById('roleBadge').textContent = currentUser.role;
           document.getElementById('authBtn').innerHTML = '<i class="fa-solid fa-right-from-bracket mr-1.5"></i> Logout';
           document.getElementById('authBtn').onclick = handleLogout;
+
+          if (currentUser.role === 'ADMIN') {
+            if (configBtn) { configBtn.disabled = false; configBtn.classList.remove('opacity-50', 'cursor-not-allowed'); }
+          } else {
+            if (configBtn) { configBtn.disabled = true; configBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
+          }
         } else {
           currentUser = null;
           document.getElementById('usernameBadge').textContent = 'Guest (Unauthenticated)';
           document.getElementById('roleBadge').textContent = 'NONE';
           document.getElementById('authBtn').innerHTML = '<i class="fa-solid fa-right-to-bracket mr-1.5"></i> Login';
           document.getElementById('authBtn').onclick = toggleAuthModal;
+          if (configBtn) { configBtn.disabled = true; configBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
         }
+        fetchAlerts();
       } catch (e) {
         console.error('Auth check error:', e);
       }
@@ -489,11 +555,45 @@
         const res = await fetch('/api/stats');
         const data = await res.json();
         document.getElementById('statTotalEvents').textContent = data.total_events.toLocaleString();
+        document.getElementById('statHdfs').textContent = (data.hdfs_events || 0).toLocaleString();
+        document.getElementById('statNasa').textContent = (data.nasa_events || 0).toLocaleString();
         document.getElementById('statErrors').textContent = data.errors.toLocaleString();
+        document.getElementById('statWarn').textContent = (data.warn_count || 0).toLocaleString();
+        document.getElementById('statErr').textContent = (data.error_count || 0).toLocaleString();
         document.getElementById('statActiveAlerts').textContent = data.active_alerts.toLocaleString();
+        document.getElementById('statResolvedAlerts').textContent = (data.resolved_alerts || 0).toLocaleString();
         document.getElementById('statRejected').textContent = data.rejected_lines.toLocaleString();
         document.getElementById('statThreads').textContent = data.active_threads;
         document.getElementById('statQueue').textContent = data.queue_size;
+
+        // Pending Alert Persistence Buffers
+        const buf = data.alert_buffer_metrics || {};
+        if (buf.hdfs) {
+          document.getElementById('bufHdfsPending').textContent = buf.hdfs.pending_count;
+          document.getElementById('bufHdfsUtil').textContent = `${buf.hdfs.buffer_utilization_pct}% utilized`;
+          document.getElementById('bufHdfsDropped').textContent = buf.hdfs.dropped_count;
+        }
+        if (buf.nasa_http) {
+          document.getElementById('bufNasaPending').textContent = buf.nasa_http.pending_count;
+          document.getElementById('bufNasaUtil').textContent = `${buf.nasa_http.buffer_utilization_pct}% utilized`;
+          document.getElementById('bufNasaDropped').textContent = buf.nasa_http.dropped_count;
+        }
+
+        const hdfsHasPending = buf.hdfs && buf.hdfs.has_pending_alerts;
+        const nasaHasPending = buf.nasa_http && buf.nasa_http.has_pending_alerts;
+        const hasDropped = (buf.hdfs && buf.hdfs.has_dropped_alerts) || (buf.nasa_http && buf.nasa_http.has_dropped_alerts);
+
+        const badge = document.getElementById('bufStatusBadge');
+        if (hasDropped) {
+          badge.className = 'text-xs px-2.5 py-0.5 rounded bg-rose-500/20 text-rose-400 border border-rose-500/30';
+          badge.textContent = 'Alerts Dropped (Backpressure Limit)';
+        } else if (hdfsHasPending || nasaHasPending) {
+          badge.className = 'text-xs px-2.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30 animate-pulse';
+          badge.textContent = 'Persisting Buffered Alerts...';
+        } else {
+          badge.className = 'text-xs px-2.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+          badge.textContent = 'Buffers Synchronized (0 Pending)';
+        }
       } catch (e) { console.error('Fetch stats error:', e); }
     }
 
@@ -512,13 +612,18 @@
 
     async function fetchAlerts() {
       try {
-        const res = await fetch('/api/alerts');
+        const statusFilter = document.getElementById('alertStatusFilter') ? document.getElementById('alertStatusFilter').value : 'ALL';
+        const url = statusFilter && statusFilter !== 'ALL' ? `/api/alerts?status=${encodeURIComponent(statusFilter)}` : '/api/alerts';
+        const res = await fetch(url);
         const data = await res.json();
         const tbody = document.getElementById('alertsTableBody');
         if (!data.alerts || data.alerts.length === 0) {
           tbody.innerHTML = '<tr><td colspan="7" class="py-6 text-center text-slate-500">No anomaly alerts recorded yet.</td></tr>';
           return;
         }
+
+        const canResolve = currentUser && (currentUser.role === 'ADMIN' || currentUser.role === 'OPERATOR');
+
         tbody.innerHTML = data.alerts.map(a => `
           <tr class="${a.status === 'ACTIVE' ? 'bg-rose-950/20 font-medium' : ''}">
             <td class="py-3 px-4 text-indigo-400">#${a.alert_id}</td>
@@ -532,7 +637,7 @@
               </span>
             </td>
             <td class="py-3 px-4 space-x-2">
-              ${a.status === 'ACTIVE' ? `<button onclick="resolveAlert(${a.alert_id})" class="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs">Resolve</button>` : '<span class="text-slate-500 text-xs">Resolved</span>'}
+              ${a.status === 'ACTIVE' ? (canResolve ? `<button onclick="resolveAlert(${a.alert_id})" class="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs">Resolve</button>` : '<span class="text-slate-500 text-xs italic" title="Admin or Operator required">Resolve (Admin/Op)</span>') : `<span class="text-slate-500 text-xs">${a.updated_by_name ? `Resolved by ${a.updated_by_name}` : 'Resolved'}</span>`}
               <button onclick="fetchAlertHistory(${a.alert_id})" class="text-indigo-400 hover:underline text-xs">History</button>
             </td>
           </tr>
