@@ -304,3 +304,145 @@ def test_zip_path_security_traversal_all_variants():
     assert res["status"] == "success"
     assert res["lines_queued"] == 1
     assert tailer.log_queue.qsize() == 1
+
+
+# =====================================================================
+# 8. ALERT PERSISTENCE RELIABILITY & RETRY TESTS
+# =====================================================================
+
+def test_alert_persistence_success():
+    """Verify that under normal DB operations, alerts are persisted immediately with 0 pending."""
+    db.update_config("hdfs_window", "60", user_id=1)
+    db.update_config("hdfs_threshold", "3", user_id=1)
+    parser.refresh_config_cache()
+
+    for i in range(3):
+        parser.parse_line(f"2026-09-12 12:00:0{i} [ERROR] namenode: Failure {i}", declared_source="hdfs")
+
+    alerts = db.get_alerts()
+    assert len(alerts) == 1
+    assert alerts[0]["source"] == "HDFS"
+    assert alerts[0]["event_count"] == 3
+    assert parser.get_pending_alerts_count() == 0
+
+
+def test_alert_persistence_transient_failure_retry_succeeds(monkeypatch):
+    """
+    Simulate transient SQLite contention: 1st save_alert() fails with OperationalError,
+    2nd attempt (retry) succeeds.
+    Verify alert is persisted to DB with 0 lost alerts and 0 remaining pending.
+    """
+    db.update_config("hdfs_window", "60", user_id=1)
+    db.update_config("hdfs_threshold", "3", user_id=1)
+    parser.refresh_config_cache()
+
+    original_save_alert = db.save_alert
+    call_count = 0
+
+    def flaky_save_alert(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            import sqlite3
+            raise sqlite3.OperationalError("database is locked (transient)")
+        return original_save_alert(*args, **kwargs)
+
+    monkeypatch.setattr(db, "save_alert", flaky_save_alert)
+
+    for i in range(3):
+        parser.parse_line(f"2026-09-12 12:00:0{i} [ERROR] namenode: Failure {i}", declared_source="hdfs")
+
+    # Retry should have been attempted and succeeded
+    assert call_count >= 2
+    alerts = db.get_alerts()
+    assert len(alerts) == 1
+    assert alerts[0]["source"] == "HDFS"
+    assert parser.get_pending_alerts_count() == 0
+
+
+def test_concurrent_threads_no_duplicate_alerts_on_threshold_crossing():
+    """
+    Verify that when multiple concurrent threads push events that cross the threshold,
+    atomic deque.clear() inside the lock guarantees exactly ONE alert is created per crossing,
+    with no duplicate alerts.
+    """
+    db.update_config("hdfs_window", "60", user_id=1)
+    db.update_config("hdfs_threshold", "5", user_id=1)
+    parser.refresh_config_cache()
+
+    # Pre-fill with 4 events (1 away from threshold 5)
+    for i in range(4):
+        parser.parse_line(f"2026-09-12 12:00:0{i} [ERROR] namenode: Pre-fill {i}", declared_source="hdfs")
+    assert len(db.get_alerts()) == 0
+
+    # Launch 6 concurrent threads each trying to add the 5th event at the exact same timestamp
+    errors = []
+    def worker():
+        try:
+            parser.parse_line("2026-09-12 12:00:05 [ERROR] namenode: Concurrent burst", declared_source="hdfs")
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert len(errors) == 0
+    # Total events: 4 + 6 = 10. Exactly 2 alerts of threshold 5. No duplicates!
+    alerts = db.get_alerts()
+    assert len(alerts) == 2
+    assert all(a["event_count"] >= 5 for a in alerts)
+    assert parser.get_pending_alerts_count() == 0
+
+
+def test_hdfs_alert_persistence_failure_does_not_block_nasa(monkeypatch):
+    """
+    Simulate severe DB failure on HDFS writes:
+    - HDFS alert retries exhaust and buffer into _pending_alert_buffers['hdfs'] without raising/crashing.
+    - NASA alert write succeeds normally and is persisted immediately into DB.
+    - HDFS alert is NOT lost; once DB recovers and flush_pending_alerts() is called, it is saved.
+    """
+    db.update_config("hdfs_window", "60", user_id=1)
+    db.update_config("hdfs_threshold", "2", user_id=1)
+    db.update_config("nasa_http_window", "60", user_id=1)
+    db.update_config("nasa_http_threshold", "2", user_id=1)
+    parser.refresh_config_cache()
+
+    original_save_alert = db.save_alert
+
+    def failing_hdfs_save_alert(source, alert_type, event_count, window_duration_sec, **kwargs):
+        if source == "HDFS":
+            raise RuntimeError("Simulated persistent HDFS database disk failure")
+        return original_save_alert(source, alert_type, event_count, window_duration_sec, **kwargs)
+
+    monkeypatch.setattr(db, "save_alert", failing_hdfs_save_alert)
+
+    # 1. Trigger HDFS burst (2 errors) -> Exhausts retries and buffers to pending queue
+    parser.parse_line("2026-09-12 12:00:00 [ERROR] namenode: HDFS error 1", declared_source="hdfs")
+    parser.parse_line("2026-09-12 12:00:01 [ERROR] namenode: HDFS error 2", declared_source="hdfs")
+
+    # Verify HDFS alert was NOT lost: it is safely buffered in pending queue
+    assert parser.get_pending_alerts_count("hdfs") == 1
+
+    # 2. Trigger NASA burst (2 errors) -> Must succeed immediately without being blocked
+    parser.parse_line('199.72.81.55 - - [01/Jul/1995:00:00:01 -0400] "GET /err1 HTTP/1.0" 500 100', declared_source="nasa_http")
+    parser.parse_line('199.72.81.55 - - [01/Jul/1995:00:00:02 -0400] "GET /err2 HTTP/1.0" 500 100', declared_source="nasa_http")
+
+    # NASA alert was persisted immediately!
+    nasa_alerts = [a for a in db.get_alerts() if a["source"] == "NASA-HTTP"]
+    assert len(nasa_alerts) == 1
+    assert parser.get_pending_alerts_count("nasa_http") == 0
+
+    # 3. Restore DB and flush pending HDFS alerts
+    monkeypatch.setattr(db, "save_alert", original_save_alert)
+    flushed = parser.flush_pending_alerts("hdfs")
+    assert flushed == 1
+    assert parser.get_pending_alerts_count("hdfs") == 0
+
+    # Both HDFS and NASA alerts now safely exist in the database
+    all_alerts = db.get_alerts()
+    sources = {a["source"] for a in all_alerts}
+    assert "HDFS" in sources
+    assert "NASA-HTTP" in sources

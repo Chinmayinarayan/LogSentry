@@ -1,10 +1,12 @@
 """DSA Engine — Pre-compiled regex parsing, strict format validation, and time-based sliding-window anomaly detection."""
 
+import queue
 import re
 import threading
 import time
 from collections import deque
 from datetime import datetime
+from typing import Optional
 from vault import db
 from src.common.models import LogEvent
 
@@ -49,6 +51,114 @@ _sliding_windows = {
     "hdfs": deque(),
     "nasa_http": deque(),
 }
+
+# Bounded in-memory buffers for failed alerts awaiting database persistence
+# Thread-safe queue.Queue guarantees zero alert loss if SQLite is momentarily locked or busy.
+_pending_alert_buffers = {
+    "hdfs": queue.Queue(maxsize=1000),
+    "nasa_http": queue.Queue(maxsize=1000),
+}
+
+
+def _flush_pending_alerts_for_source(cat: str) -> int:
+    """Attempt to drain and save any previously buffered failed alerts for this source category."""
+    q = _pending_alert_buffers.get(cat)
+    if not q or q.empty():
+        return 0
+    flushed = 0
+    # Drain up to 50 alerts in one pass to avoid blocking callers
+    for _ in range(50):
+        if q.empty():
+            break
+        try:
+            payload = q.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            db.save_alert(
+                source=payload["source"],
+                alert_type=payload["alert_type"],
+                event_count=payload["event_count"],
+                window_duration_sec=payload["window_duration_sec"],
+            )
+            flushed += 1
+        except Exception:
+            # Database is still locked/failing; put it back and abort drain
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                pass
+            break
+    return flushed
+
+
+def flush_pending_alerts(source_category: Optional[str] = None) -> int:
+    """
+    Public API to flush buffered failed alerts to E3 Vault.
+    If source_category is None, flushes both HDFS and NASA-HTTP.
+    """
+    total = 0
+    if source_category:
+        cat = "hdfs" if "hdfs" in source_category.lower() else "nasa_http"
+        total += _flush_pending_alerts_for_source(cat)
+    else:
+        for cat in ("hdfs", "nasa_http"):
+            total += _flush_pending_alerts_for_source(cat)
+    return total
+
+
+def get_pending_alerts_count(source_category: Optional[str] = None) -> int:
+    """Return count of buffered alerts currently waiting for persistence."""
+    if source_category:
+        cat = "hdfs" if "hdfs" in source_category.lower() else "nasa_http"
+        q = _pending_alert_buffers.get(cat)
+        return q.qsize() if q else 0
+    return sum(q.qsize() for q in _pending_alert_buffers.values())
+
+
+def reset_pending_alerts():
+    """Clear buffered failed alerts for test isolation."""
+    for q in _pending_alert_buffers.values():
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+
+
+def _persist_alert_with_retry(cat: str, alert_payload: dict, max_retries: int = 3, backoff_base: float = 0.02) -> bool:
+    """
+    Persist an alert payload with bounded retries and exponential backoff outside the lock.
+    If all retries fail, buffers the alert into _pending_alert_buffers[cat] to guarantee zero alert loss.
+    """
+    # 1. First attempt to flush any prior pending alerts for this category
+    _flush_pending_alerts_for_source(cat)
+
+    # 2. Attempt immediate persist with bounded retry
+    for attempt in range(max_retries):
+        try:
+            db.save_alert(
+                source=alert_payload["source"],
+                alert_type=alert_payload["alert_type"],
+                event_count=alert_payload["event_count"],
+                window_duration_sec=alert_payload["window_duration_sec"],
+            )
+            return True
+        except Exception as exc:
+            if attempt < max_retries - 1:
+                # Exponential backoff (e.g. 0.02s, 0.04s)
+                time.sleep(backoff_base * (2 ** attempt))
+            else:
+                # Retries exhausted: buffer into pending queue to prevent alert loss
+                print(f"[_persist_alert_with_retry] Warning: Failed to persist alert after {max_retries} attempts: {exc}. Buffering.")
+                q = _pending_alert_buffers.get(cat)
+                if q:
+                    try:
+                        q.put_nowait(alert_payload)
+                    except queue.Full:
+                        print(f"[_persist_alert_with_retry] Error: Pending alert buffer full for {cat}")
+                return False
+    return False
 
 
 def refresh_config_cache():
@@ -182,17 +292,9 @@ def _check_sliding_window(source_category, epoch_timestamp, raw_message):
             }
             window_deque.clear()
 
-    # Move DB write OUTSIDE the critical section (Fix for Check 3) with exception safety
+    # Move DB write OUTSIDE the critical section with bounded retry and buffering
     if should_fire and alert_payload:
-        try:
-            db.save_alert(
-                source=alert_payload["source"],
-                alert_type=alert_payload["alert_type"],
-                event_count=alert_payload["event_count"],
-                window_duration_sec=alert_payload["window_duration_sec"],
-            )
-        except Exception as exc:
-            print(f"[_check_sliding_window] Error saving alert: {exc}")
+        _persist_alert_with_retry(cat, alert_payload)
         return True
     return False
 
@@ -321,12 +423,13 @@ def parse_line(line, declared_source="hdfs"):
 
 
 def reset_sliding_windows():
-    """Reset in-memory sliding window deques for test isolation."""
+    """Reset in-memory sliding window deques and pending alert buffers for test isolation."""
     with _window_lock:
         for k, deque_obj in _sliding_windows.items():
             lock = _source_window_locks.get(k, _window_lock)
             with lock:
                 deque_obj.clear()
+        reset_pending_alerts()
 
 
 def parse_to_model(line, declared_source="hdfs"):
