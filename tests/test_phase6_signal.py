@@ -312,7 +312,7 @@ def test_unauthorized_access_rejection(client):
 # ---------------------------------------------------------------------------
 
 def test_alert_resolution_and_audit_history(client):
-    """Verify alert resolution updates status and logs immutable audit trail."""
+    """Verify alert resolution updates status and logs append-only audit trail."""
     aid = db.save_alert("hdfs", "ANOMALY_BURST", 5, 60)
 
     # Resolve as operator

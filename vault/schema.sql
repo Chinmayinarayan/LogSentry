@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS config (
 );
 
 -- 5. AUDIT HISTORY ENTITY (SRS: AUDIT_LOG)
--- Immutable audit record for state mutations (alert resolutions, threshold updates)
+-- Append-only application audit record for state mutations (alert resolutions, threshold updates)
 CREATE TABLE IF NOT EXISTS history (
     history_id INTEGER PRIMARY KEY AUTOINCREMENT,
     table_name TEXT NOT NULL,
