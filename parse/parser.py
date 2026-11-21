@@ -72,7 +72,9 @@ _pending_alert_locks = {
     "hdfs": threading.Lock(),
     "nasa_http": threading.Lock(),
 }
-_flush_locks = {
+# Per-source persistence locks serialize alert writes to database
+# Guarantees strict FIFO ordering under concurrent alert arrivals without cross-source blocking.
+_source_persistence_locks = {
     "hdfs": threading.Lock(),
     "nasa_http": threading.Lock(),
 }
@@ -107,19 +109,19 @@ def _buffer_failed_alert(cat: str, alert_payload: dict) -> bool:
     return False
 
 
-def _flush_pending_alerts_for_source(cat: str, max_batch: int = 50) -> int:
+def _flush_pending_alerts_for_source(cat: str, max_batch: int = 50, max_retries: int = 1, backoff_base: float = 0.02) -> int:
     """
-    Attempt to persist previously buffered failed alerts for source category.
-    Thread-safety & Reliability:
-    - Uses non-blocking _flush_locks[cat] so concurrent flushes do not interleave or duplicate writes.
-    - Peeks at dq[0] under lock, attempts db.save_alert outside lock, and only pops dq[0] on success.
-    - If a write fails, dq[0] remains at the head of the deque (no re-queuing, no reordering, no drop risk).
+    Attempt to persist previously buffered failed alerts for source category in strict FIFO order.
+    Thread-safety & Concurrency:
+    - Serialized per source via _source_persistence_locks[cat].
+    - Concurrent flushes or arrivals for the same source queue up cleanly on _source_persistence_locks[cat].
+    - Peeks at dq[0] under _pending_alert_locks[cat], attempts db.save_alert outside buffer lock.
+    - If a write fails, retries up to max_retries with backoff outside the buffer lock.
+    - If all retries fail, dq[0] remains at the head of the deque, and the flush terminates.
+    - Only pops dq[0] after confirmed successful database write.
     """
-    if not _flush_locks[cat].acquire(blocking=False):
-        return 0  # Another thread is actively flushing this category
-
-    flushed = 0
-    try:
+    with _source_persistence_locks[cat]:
+        flushed = 0
         for _ in range(max_batch):
             with _pending_alert_locks[cat]:
                 dq = _pending_alert_buffers[cat]
@@ -127,14 +129,24 @@ def _flush_pending_alerts_for_source(cat: str, max_batch: int = 50) -> int:
                     break
                 payload = dq[0]  # Peek without popping
 
-            try:
-                db.save_alert(
-                    source=payload["source"],
-                    alert_type=payload["alert_type"],
-                    event_count=payload["event_count"],
-                    window_duration_sec=payload["window_duration_sec"],
-                )
-            except Exception:
+            write_success = False
+            for attempt in range(max_retries):
+                try:
+                    db.save_alert(
+                        source=payload["source"],
+                        alert_type=payload["alert_type"],
+                        event_count=payload["event_count"],
+                        window_duration_sec=payload["window_duration_sec"],
+                    )
+                    write_success = True
+                    break
+                except Exception as exc:
+                    if attempt < max_retries - 1:
+                        time.sleep(backoff_base * (2 ** attempt))
+                    else:
+                        print(f"[_flush_pending_alerts_for_source] Write failed after {max_retries} attempts: {exc}")
+
+            if not write_success:
                 # DB write failed: alert remains at dq[0], stop flush attempt
                 break
 
@@ -143,10 +155,8 @@ def _flush_pending_alerts_for_source(cat: str, max_batch: int = 50) -> int:
                 if dq and dq[0] is payload:
                     dq.popleft()
                     flushed += 1
-    finally:
-        _flush_locks[cat].release()
 
-    return flushed
+        return flushed
 
 
 def flush_pending_alerts(source_category: Optional[str] = None) -> int:
@@ -222,39 +232,19 @@ def reset_pending_alerts():
 
 def _persist_alert_with_retry(cat: str, alert_payload: dict, max_retries: int = 3, backoff_base: float = 0.02) -> bool:
     """
-    Persist an alert payload with bounded retries and exponential backoff outside the lock.
-    If prior alerts remain unpersisted, buffers the alert to maintain FIFO order.
-    If retries fail, buffers the alert into the bounded pending buffer.
+    Persist an alert payload with strict FIFO ordering per source.
+    1. Buffers alert_payload into _pending_alert_buffers[cat] under _pending_alert_locks[cat].
+       (If buffer is at capacity, it is dropped and _dropped_alerts_count is incremented).
+    2. Calls _flush_pending_alerts_for_source(cat) which holds _source_persistence_locks[cat].
+    3. Guarantees that any alerts buffered earlier are written BEFORE this alert.
+    4. Guarantees that concurrent arrivals cannot reorder writes.
     """
-    # 1. Attempt to flush any prior pending alerts for this category
-    _flush_pending_alerts_for_source(cat)
+    buffered = _buffer_failed_alert(cat, alert_payload)
+    if not buffered:
+        return False
 
-    # 2. If the buffer still contains pending alerts, preserve strict FIFO order
-    with _pending_alert_locks[cat]:
-        has_pending = len(_pending_alert_buffers[cat]) > 0
-
-    if has_pending:
-        return _buffer_failed_alert(cat, alert_payload)
-
-    # 3. Buffer is clean: attempt immediate persist with bounded retry
-    for attempt in range(max_retries):
-        try:
-            db.save_alert(
-                source=alert_payload["source"],
-                alert_type=alert_payload["alert_type"],
-                event_count=alert_payload["event_count"],
-                window_duration_sec=alert_payload["window_duration_sec"],
-            )
-            return True
-        except Exception as exc:
-            if attempt < max_retries - 1:
-                # Exponential backoff (e.g. 0.02s, 0.04s)
-                time.sleep(backoff_base * (2 ** attempt))
-            else:
-                # Retries exhausted: buffer into pending deque
-                print(f"[_persist_alert_with_retry] Warning: Failed to persist alert after {max_retries} attempts: {exc}. Buffering.")
-                return _buffer_failed_alert(cat, alert_payload)
-    return False
+    flushed = _flush_pending_alerts_for_source(cat, max_retries=max_retries, backoff_base=backoff_base)
+    return flushed > 0
 
 
 def refresh_config_cache():

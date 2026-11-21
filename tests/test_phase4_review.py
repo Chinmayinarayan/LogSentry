@@ -677,3 +677,214 @@ def test_new_alert_arrival_preserves_fifo_order_behind_unflushed_alerts(monkeypa
     assert len(all_final) == 4
     in_order = sorted(all_final, key=lambda a: a["alert_id"])
     assert [a["alert_type"] for a in in_order] == ["ALERT_A", "ALERT_B", "ALERT_C", "ALERT_D"]
+
+
+# =====================================================================
+# 10. STRICT CONCURRENCY AUDIT TESTS (TESTS A, B, C)
+# =====================================================================
+
+def test_concurrent_direct_persistence_preserves_arrival_fifo_order():
+    """
+    Test A — Concurrent direct persistence:
+    - Start with an empty pending buffer.
+    - Launch multiple threads with uniquely identifiable alert payloads.
+    - Use synchronization barriers to force overlapping persistence attempts.
+    - Verify database insertion order strictly matches defined per-source arrival order.
+    - Verify no alerts are duplicated or silently lost.
+    """
+    parser.reset_pending_alerts()
+    num_threads = 6
+    barrier = threading.Barrier(num_threads)
+    errors = []
+
+    # Sequential arrival definition: payloads are registered in arrival sequence 0..5
+    payloads = [
+        {
+            "source": "HDFS",
+            "alert_type": f"CONCURRENT_FIFO_{i}",
+            "event_count": i + 1,
+            "window_duration_sec": 60,
+        }
+        for i in range(num_threads)
+    ]
+
+    def worker(idx):
+        try:
+            # Enqueue in strict arrival order
+            parser._buffer_failed_alert("hdfs", payloads[idx])
+            # Synchronize all threads at barrier to force overlapping persistence attempts
+            barrier.wait(timeout=5.0)
+            # All threads race to flush concurrently
+            parser._flush_pending_alerts_for_source("hdfs")
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(num_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert len(errors) == 0
+    assert parser.get_pending_alerts_count("hdfs") == 0
+
+    # Verify database insertion order matches arrival order [CONCURRENT_FIFO_0 ... CONCURRENT_FIFO_5]
+    alerts_in_db = db.get_alerts()
+    assert len(alerts_in_db) == num_threads
+    in_order = sorted(alerts_in_db, key=lambda a: a["alert_id"])
+    expected_order = [f"CONCURRENT_FIFO_{i}" for i in range(num_threads)]
+    assert [a["alert_type"] for a in in_order] == expected_order
+
+
+def test_pending_alerts_plus_concurrent_arrivals_no_bypass(monkeypatch):
+    """
+    Test B — Pending alerts plus concurrent arrivals:
+    - Preload older pending alerts (PENDING_1, PENDING_2).
+    - Start multiple concurrent new alert arrivals (NEW_1, NEW_2, NEW_3).
+    - Simulate temporary database failure during flush so PENDING_2 cannot persist.
+    - Verify newer alerts cannot bypass older pending alerts.
+    - Restore database and flush.
+    - Verify final insertion order: PENDING_1, PENDING_2, NEW_1, NEW_2, NEW_3.
+    """
+    parser.reset_pending_alerts()
+
+    # Preload older pending alerts
+    parser._buffer_failed_alert("hdfs", {
+        "source": "HDFS",
+        "alert_type": "PENDING_1",
+        "event_count": 1,
+        "window_duration_sec": 60,
+    })
+    parser._buffer_failed_alert("hdfs", {
+        "source": "HDFS",
+        "alert_type": "PENDING_2",
+        "event_count": 2,
+        "window_duration_sec": 60,
+    })
+    assert parser.get_pending_alerts_count("hdfs") == 2
+
+    # Simulate DB failure on PENDING_2
+    original_save = db.save_alert
+
+    def fail_on_pending_2(source, alert_type, event_count, window_duration_sec, **kwargs):
+        if alert_type == "PENDING_2":
+            import sqlite3
+            raise sqlite3.OperationalError("database is locked on PENDING_2")
+        return original_save(source, alert_type, event_count, window_duration_sec, **kwargs)
+
+    monkeypatch.setattr(db, "save_alert", fail_on_pending_2)
+
+    # Launch 3 concurrent new alert arrivals: NEW_1, NEW_2, NEW_3
+    barrier = threading.Barrier(3)
+    errors = []
+
+    def arrival_worker(idx):
+        try:
+            barrier.wait(timeout=5.0)
+            payload = {
+                "source": "HDFS",
+                "alert_type": f"NEW_{idx}",
+                "event_count": 10 + idx,
+                "window_duration_sec": 60,
+            }
+            parser._persist_alert_with_retry("hdfs", payload, max_retries=1)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=arrival_worker, args=(i,)) for i in range(1, 4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert len(errors) == 0
+
+    # Only PENDING_1 should have been saved to DB!
+    # PENDING_2 and all NEW_* alerts must still be waiting in the pending buffer!
+    alerts_in_db = db.get_alerts()
+    assert len(alerts_in_db) == 1
+    assert alerts_in_db[0]["alert_type"] == "PENDING_1"
+
+    # Pending buffer must contain PENDING_2 and the 3 NEW alerts (total 4)
+    assert parser.get_pending_alerts_count("hdfs") == 4
+
+    # Now restore database and flush
+    monkeypatch.setattr(db, "save_alert", original_save)
+    flushed = parser.flush_pending_alerts("hdfs")
+    assert flushed == 4
+    assert parser.get_pending_alerts_count("hdfs") == 0
+
+    # Verify final insertion order: PENDING_1, PENDING_2, followed by NEW alerts
+    final_alerts = db.get_alerts()
+    assert len(final_alerts) == 5
+    in_order = sorted(final_alerts, key=lambda a: a["alert_id"])
+    alert_types = [a["alert_type"] for a in in_order]
+    assert alert_types[0] == "PENDING_1"
+    assert alert_types[1] == "PENDING_2"
+    assert set(alert_types[2:]) == {"NEW_1", "NEW_2", "NEW_3"}
+
+
+def test_source_independence_hdfs_retries_do_not_block_nasa(monkeypatch):
+    """
+    Test C — Source independence:
+    - Cause HDFS persistence to experience a long delay (sleep 0.3s inside db.save_alert).
+    - Launch HDFS persistence in background thread.
+    - Simultaneously trigger NASA-HTTP alert persistence.
+    - Verify NASA-HTTP is NOT blocked by HDFS lock and persists immediately (< 0.2s).
+    - Wait for HDFS to finish. Verify both alerts exist in DB.
+    """
+    parser.reset_pending_alerts()
+    original_save = db.save_alert
+
+    def slow_hdfs_save(source, alert_type, event_count, window_duration_sec, **kwargs):
+        if source == "HDFS":
+            time.sleep(0.3)  # Hold HDFS persistence lock for 300ms
+        return original_save(source, alert_type, event_count, window_duration_sec, **kwargs)
+
+    monkeypatch.setattr(db, "save_alert", slow_hdfs_save)
+
+    hdfs_started = threading.Event()
+    hdfs_finished = threading.Event()
+    nasa_persisted_time = [0.0]
+
+    def hdfs_worker():
+        hdfs_started.set()
+        parser._persist_alert_with_retry("hdfs", {
+            "source": "HDFS",
+            "alert_type": "SLOW_HDFS_ALERT",
+            "event_count": 5,
+            "window_duration_sec": 60,
+        })
+        hdfs_finished.set()
+
+    t_hdfs = threading.Thread(target=hdfs_worker)
+    t_hdfs.start()
+
+    # Wait until HDFS starts its slow write
+    hdfs_started.wait(timeout=2.0)
+    time.sleep(0.05)  # Ensure HDFS is inside its sleep/lock
+
+    # NASA attempts persistence while HDFS is still busy
+    nasa_start = time.time()
+    res_nasa = parser._persist_alert_with_retry("nasa_http", {
+        "source": "NASA-HTTP",
+        "alert_type": "FAST_NASA_ALERT",
+        "event_count": 3,
+        "window_duration_sec": 60,
+    })
+    nasa_persisted_time[0] = time.time() - nasa_start
+
+    # NASA persistence must have succeeded without waiting for HDFS 0.3s delay
+    assert res_nasa is True
+    assert nasa_persisted_time[0] < 0.2, f"NASA was blocked by HDFS! Took {nasa_persisted_time[0]:.3f}s"
+    assert hdfs_finished.is_set() is False, "HDFS finished too fast, invalidating concurrency test"
+
+    # Wait for HDFS to finish
+    t_hdfs.join(timeout=3.0)
+    assert hdfs_finished.is_set() is True
+
+    # Both alerts must be safely recorded
+    alerts = db.get_alerts()
+    assert len(alerts) == 2
+    sources = {a["source"] for a in alerts}
+    assert sources == {"HDFS", "NASA-HTTP"}
