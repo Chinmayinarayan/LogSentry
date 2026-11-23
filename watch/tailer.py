@@ -151,32 +151,164 @@ def get_active_watchers() -> Dict[str, Dict[str, Any]]:
         return result
 
 
-def worker_thread(source_name: str, file_path: str, stop_event: threading.Event):
-    """
-    Continuous worker thread tailing a live log file (equivalent to `tail -f`).
-    FR-01, FR-02:
-    - Dedicated thread per live source.
-    - Moves to EOF initially to capture incoming continuous records.
-    - Zero dropped lines: log_queue.put() blocks when queue reaches maxsize=10,000 (backpressure).
-    """
-    try:
-        directory = os.path.dirname(file_path)
-        if directory and not os.path.exists(directory):
-            os.makedirs(directory, exist_ok=True)
-        if not os.path.exists(file_path):
-            open(file_path, "a", encoding="utf-8").close()
 
-        with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
-            fh.seek(0, os.SEEK_END)
-            while not stop_event.is_set():
-                line, is_oversized = _safe_readline(fh, MAX_RECORD_SIZE)
-                if is_oversized:
-                    parser.parse_line(b"OVERSIZED_RECORD: Line exceeds 64KB limit", declared_source=source_name)
-                    continue
-                if line:
-                    clean_line = line.rstrip("\r\n")
-                    if clean_line:
-                        # Non-blocking backpressure: blocks up to 0.2s then checks stop_event
+
+def _get_file_id(path: str):
+    """Return a tuple (device, inode) identifying the file, or None if unavailable."""
+    try:
+        st = os.stat(path)
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+
+def worker_thread(source_name: str, file_path: str, stop_event: threading.Event):
+    """Tail a file without holding a persistent Windows handle.
+
+    The watcher tracks the file identity via `_get_file_id` and a byte offset.
+    It opens the file *only* for the short period needed to read any newly
+    appended data, then closes it. This avoids the `GENERIC_READ | DELETE`
+    lock that previously prevented other processes from appending to the log.
+    """
+    # Ensure directory and file exist.
+    directory = os.path.dirname(file_path)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+    if not os.path.exists(file_path):
+        open(file_path, "a", encoding="utf-8").close()
+
+    # Initial state – start at the end of the existing file.
+    prev_id = _get_file_id(file_path)
+    offset = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+    partial = ""
+
+    # Initialise SHA‑256 digest for processed prefix.
+    _digest = hashlib.sha256()
+    _digest_valid = True
+    if offset > 0:
+        try:
+            with open(file_path, "rb") as bf:
+                data = bf.read(offset)
+                if len(data) < offset:
+                    _digest_valid = False
+                else:
+                    _digest.update(data)
+        except OSError:
+            _digest_valid = False
+
+    def _open_file():
+        """Open the file with Windows sharing flags (short‑lived)."""
+        if os.name == "nt":
+            import msvcrt
+            import ctypes
+            from ctypes import wintypes
+
+            GENERIC_READ = 0x80000000
+            DELETE = 0x00010000
+            FILE_SHARE_READ = 0x00000001
+            FILE_SHARE_WRITE = 0x00000002
+            FILE_SHARE_DELETE = 0x00000004
+            OPEN_EXISTING = 3
+
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            CreateFileW = kernel32.CreateFileW
+            CreateFileW.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            CreateFileW.restype = wintypes.HANDLE
+
+            handle = CreateFileW(
+                file_path,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                0,
+                None,
+            )
+            if handle == wintypes.HANDLE(-1).value:
+                raise OSError(ctypes.get_last_error(), f"CreateFileW failed for {file_path}")
+            try:
+                fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+            except Exception:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                raise
+            return os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+        else:
+            return open(file_path, "r", encoding="utf-8", errors="replace")
+
+    while not stop_event.is_set():
+        # Detect temporary unavailability.
+        cur_id = _get_file_id(file_path)
+        if cur_id is None:
+            time.sleep(0.1)
+            continue
+
+        # ----- Same‑inode truncation detection (every cycle) -----
+        try:
+            cur_size = os.path.getsize(file_path)
+        except OSError:
+            cur_size = offset
+        if cur_size < offset:
+            offset = 0
+            partial = ""
+            _digest = hashlib.sha256()
+            _digest_valid = True
+            time.sleep(0.1)
+            continue
+
+        # ----- Replacement detection (inode change) -----
+        if cur_id != prev_id:
+            prev_id = cur_id
+            try:
+                new_size = os.path.getsize(file_path)
+            except OSError:
+                new_size = 0
+
+            prefix_matches = False
+            if _digest_valid and new_size >= offset:
+                try:
+                    with open(file_path, "rb") as bf:
+                        new_prefix = bf.read(offset)
+                        if len(new_prefix) == offset and hashlib.sha256(new_prefix).digest() == _digest.digest():
+                            prefix_matches = True
+                except OSError:
+                    pass
+
+            if not prefix_matches:
+                offset = 0
+                partial = ""
+                _digest = hashlib.sha256()
+                _digest_valid = True
+            else:
+                partial = ""
+
+        # Remember start offset for incremental digest update.
+        cycle_start_offset = offset
+
+        # Open, seek, and read any new data.
+        try:
+            with _open_file() as fh:
+                fh.seek(offset)
+                while not stop_event.is_set():
+                    line, is_oversized = _safe_readline(fh, MAX_RECORD_SIZE)
+                    if not line:
+                        break
+                    if is_oversized:
+                        parser.parse_line(b"OVERSIZED_RECORD: Line exceeds 64KB limit", declared_source=source_name)
+                        partial = ""
+                        offset = fh.tell()
+                        continue
+                    if line.endswith("\n") or line.endswith("\r"):
+                        full_line = partial + line
+                        partial = ""
+                        clean_line = full_line.rstrip("\r\n")
                         while not stop_event.is_set():
                             try:
                                 log_queue.put((source_name, clean_line), timeout=0.2)
@@ -184,10 +316,29 @@ def worker_thread(source_name: str, file_path: str, stop_event: threading.Event)
                                 break
                             except queue.Full:
                                 continue
-                else:
-                    time.sleep(0.1)
-    except Exception as exc:
-        print(f"[worker_thread] Watcher '{source_name}' error on file '{file_path}': {exc}")
+                    else:
+                        partial += line
+                    offset = fh.tell()
+            # Incremental digest update for bytes read this cycle.
+            if _digest_valid:
+                try:
+                    with open(file_path, "rb") as bf:
+                        bf.seek(cycle_start_offset)
+                        new_bytes = bf.read(offset - cycle_start_offset)
+                        if len(new_bytes) != (offset - cycle_start_offset):
+                            _digest_valid = False
+                        else:
+                            _digest.update(new_bytes)
+                except OSError:
+                    _digest_valid = False
+        except Exception as exc:
+            print(f"[worker_thread] Watcher '{source_name}' error on file '{file_path}': {exc}")
+            time.sleep(0.1)
+            continue
+
+        # No new data – pause briefly.
+        time.sleep(0.1)
+
 
 
 def start_watcher(source_name: str, file_path: str) -> threading.Thread:
